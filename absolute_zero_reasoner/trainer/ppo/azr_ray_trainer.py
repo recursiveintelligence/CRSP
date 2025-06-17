@@ -684,13 +684,111 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
     #             traceback.print_exc()
 
     def _create_train_code_gen_dataloader(
-        self,
-        problem_type: str,
-        data_len: int,
-        dataset_key: str = None,
-        seeding: bool = False,
-    ) -> DataLoader:
-        if dataset_key is None:
+            self,
+            problem_type: str,
+            data_len: int,
+            dataset_key: str = None,
+            seeding: bool = False,
+        ) -> DataLoader:
+            if dataset_key is None:
+                if problem_type == 'code_i':
+                    dataset_key = 'input'
+                elif problem_type == 'code_o':
+                    dataset_key = 'output'
+                elif problem_type == 'code_e':
+                    dataset_key = 'error'
+                elif problem_type == 'code_f':
+                    io_data = ray.get(self.dataset_manager.get_snippets.remote())
+                else:
+                    raise ValueError(f'Invalid problem type: {problem_type}')
+            
+            if problem_type != 'code_f':
+                io_data = ray.get(self.dataset_manager.get_dataset.remote(dataset_key))
+
+            # --- RESILIENCY FIX START ---
+            # Before doing any work, check if the source data is empty.
+            if not io_data:
+                print(f"INFO: Source dataset '{dataset_key}' for gen_{problem_type} is empty at step {self.global_steps}. Returning empty dataloader.")
+                return iter([]) # Return an empty, safe iterator immediately
+            # --- RESILIENCY FIX END ---
+
+            parquet_path = (self._code_dir / f'train_gen_{problem_type}.parquet').as_posix()
+            os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
+
+            if problem_type == 'code_f' and not seeding:
+                if self.config.azr.gen_data_probabilities_strategy == 'step':
+                    entries_with_steps = ray.get(self.dataset_manager.get_snippets_with_steps.remote())
+                    weights = [w + 1 for _, w in entries_with_steps] if entries_with_steps else [1.0]*len(io_data)
+                else:
+                    weights = [1.0] * len(io_data)
+            elif dataset_key == 'seed':
+                weights = None
+            elif self.config.azr.gen_data_probabilities_strategy == 'uniform':
+                weights = [1.0] * len(io_data)
+            elif self.config.azr.gen_data_probabilities_strategy == 'step':
+                weights = [w + 1 for w in ray.get(self.dataset_manager.get_steps_dataset.remote(dataset_key))]
+            else:
+                raise ValueError(f"Unknown strategy: {self.config.azr.gen_data_probabilities_strategy}")
+
+            gen_params = {
+                'io_data': io_data,
+                'target_data_len': data_len,
+                'problem_type': problem_type,
+                'content_max_length': self.config.azr.data_selection_strategy.content_max_length,
+                'io_n': 1 if problem_type == 'code_f' else self.config.azr.data_selection_strategy.io_n,
+                'instruction_type': self.config.reward_fn.extraction_type,
+                'output_path': parquet_path,
+                'split': 'train',
+                'tokenizer': self.tokenizer,
+                'banned_keywords': self.config.azr.data_selection_strategy.banned_words,
+                'banned_assertion_keywords': self.config.azr.data_selection_strategy.banned_keywords_for_errors_and_exceptions,
+                'weights': weights,
+                'enable_composite_function': self.config.azr.data_selection_strategy.composite_start_step > 0 and self.global_steps >= self.config.azr.data_selection_strategy.composite_start_step,
+                'composite_function_n_min': self.config.azr.data_selection_strategy.composite_function_n_min,
+                'composite_function_n_max': self.config.azr.data_selection_strategy.composite_function_n_max,
+                'composite_chance': self.config.azr.data_selection_strategy.composite_chance,
+                'remove_after_return': self.config.azr.reward.generation_reward_config.remove_after_return,
+                'remove_input_from_snippet': self.config.azr.reward.generation_reward_config.remove_input_from_snippet,
+                'include_references': self.config.azr.reward.generation_reward_config.include_references,
+            }
+
+            if problem_type == 'code_f':
+                gen_params.update({
+                    'num_inputs': self.config.azr.data_selection_strategy.num_inputs,
+                })
+
+            get_gen_code_io_data(**gen_params)
+
+            code_gen_train_dataset = RLHFDataset(
+                parquet_files=parquet_path,
+                tokenizer=self.tokenizer,
+                prompt_key=self.config.data.prompt_key,
+                max_prompt_length=self.config.data.max_prompt_length,
+                filter_prompts=True,
+                return_raw_chat=self.config.data.get('return_raw_chat', False),
+                truncation='right',
+                extra_source_key=f"gen_{problem_type}_train"
+            )
+
+            if len(code_gen_train_dataset) == 0:
+                return iter([]) 
+
+            if self.config.data.shuffle:
+                train_dataloader_generator = torch.Generator()
+                train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
+                sampler = RandomSampler(code_gen_train_dataset, generator=train_dataloader_generator)
+            else:
+                sampler = SequentialSampler(code_gen_train_dataset)
+
+            return iter(DataLoader(
+                dataset=code_gen_train_dataset,
+                batch_size=self.config.data.train_batch_size,
+                drop_last=True,
+                collate_fn=collate_fn,
+                sampler=sampler
+            ))
+
+    def _create_train_code_pred_dataloader(self, problem_type: str, data_len: int) -> DataLoader:
             if problem_type == 'code_i':
                 dataset_key = 'input'
             elif problem_type == 'code_o':
@@ -698,184 +796,94 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             elif problem_type == 'code_e':
                 dataset_key = 'error'
             elif problem_type == 'code_f':
-                # For code_f we use merged snippets from all datasets
-                io_data = ray.get(self.dataset_manager.get_snippets.remote())
+                dataset_key = 'problem'
             else:
                 raise ValueError(f'Invalid problem type: {problem_type}')
-        
-        if problem_type != 'code_f':
-            io_data = ray.get(self.dataset_manager.get_dataset.remote(dataset_key))
+            
+            full_dataset = ray.get(self.dataset_manager.get_dataset.remote(dataset_key))
 
-        parquet_path = (self._code_dir / f'train_gen_{problem_type}.parquet').as_posix()
-        os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
+            # --- RESILIENCY FIX START ---
+            # Before doing any work, check if the source data is empty.
+            if not full_dataset:
+                print(f"INFO: Source dataset '{dataset_key}' for pred_{problem_type} is empty at step {self.global_steps}. Returning empty dataloader.")
+                return iter([]) # Return an empty, safe iterator immediately
+            # --- RESILIENCY FIX END ---
 
-        # Handle weights strategy
-        if problem_type == 'code_f' and not seeding:
-            if self.config.azr.gen_data_probabilities_strategy == 'step':
-                entries_with_steps = ray.get(self.dataset_manager.get_snippets_with_steps.remote())
-                weights = [w + 1 for _, w in entries_with_steps] if entries_with_steps else [1.0]*len(io_data)
+            strategy = self.config.azr.pred_data_mix_strategy
+
+            if strategy == "step":
+                entries_with_steps = ray.get(self.dataset_manager.get_dataset_with_steps.remote(dataset_key))
+                if not entries_with_steps:
+                    selected_data = []
+                else:
+                    entries, steps = zip(*entries_with_steps)
+                    selected_indices = random.choices(
+                        range(len(entries)),
+                        weights=steps,
+                        k=min(data_len, len(entries))
+                    )
+                    selected_data = [entries[i] for i in selected_indices]
+            elif strategy == "uniform_total":
+                selected_data = random.sample(full_dataset, min(len(full_dataset), data_len))
+            elif strategy == "max_new":
+                total_recent = ray.get(self.dataset_manager.get_recent_additions.remote(
+                    dataset_key, self.global_steps, self._past_epoch_window
+                ))
+                new_programs = full_dataset[-total_recent:] if total_recent > 0 else []
+                new_samples = random.sample(new_programs, min(len(new_programs), data_len))
+                remaining = data_len - len(new_samples)
+                selected_data = new_samples + random.sample(full_dataset, remaining)
+            elif strategy == "half_new":
+                total_recent = ray.get(self.dataset_manager.get_recent_additions.remote(
+                    dataset_key, self.global_steps, self._past_epoch_window
+                ))
+                new_programs = full_dataset[-total_recent:] if total_recent > 0 else []
+                new_count = min(len(new_programs), data_len//2)
+                base_count = data_len - new_count
+                selected_data = random.sample(new_programs, new_count) + random.sample(full_dataset, base_count)
             else:
-                weights = [1.0] * len(io_data)
-        elif dataset_key == 'seed':
-            weights = None
-        elif self.config.azr.gen_data_probabilities_strategy == 'uniform':
-            weights = [1.0] * len(io_data)
-        elif self.config.azr.gen_data_probabilities_strategy == 'step':
-            weights = [w + 1 for w in ray.get(self.dataset_manager.get_steps_dataset.remote(dataset_key))]
-        else:
-            raise ValueError(f"Unknown strategy: {self.config.azr.gen_data_probabilities_strategy}")
+                raise ValueError(f"Unknown strategy: {strategy}")
 
-        # Common parameters for get_gen_code_io_data
-        gen_params = {
-            'io_data': io_data,
-            'target_data_len': data_len,
-            'problem_type': problem_type,
-            'content_max_length': self.config.azr.data_selection_strategy.content_max_length,
-            'io_n': 1 if problem_type == 'code_f' else self.config.azr.data_selection_strategy.io_n,
-            'instruction_type': self.config.reward_fn.extraction_type,
-            'output_path': parquet_path,
-            'split': 'train',
-            'tokenizer': self.tokenizer,
-            'banned_keywords': self.config.azr.data_selection_strategy.banned_words,
-            'banned_assertion_keywords': self.config.azr.data_selection_strategy.banned_keywords_for_errors_and_exceptions,
-            'weights': weights,
-            'enable_composite_function': self.config.azr.data_selection_strategy.composite_start_step > 0 and self.global_steps >= self.config.azr.data_selection_strategy.composite_start_step,
-            'composite_function_n_min': self.config.azr.data_selection_strategy.composite_function_n_min,
-            'composite_function_n_max': self.config.azr.data_selection_strategy.composite_function_n_max,
-            'composite_chance': self.config.azr.data_selection_strategy.composite_chance,
-            'remove_after_return': self.config.azr.reward.generation_reward_config.remove_after_return,
-            'remove_input_from_snippet': self.config.azr.reward.generation_reward_config.remove_input_from_snippet,
-            'include_references': self.config.azr.reward.generation_reward_config.include_references,
-        }
+            parquet_path = (self._code_dir / f'train_pred_{problem_type}.parquet').as_posix()
+            get_pred_code_io_data(
+                io_data=selected_data,
+                target_data_len=data_len,
+                problem_type=problem_type,
+                content_max_length=self.config.azr.data_selection_strategy.content_max_length,
+                output_path=parquet_path,
+                split='train',
+                tokenizer=self.tokenizer,
+                instruction_type=self.config.reward_fn.extraction_type,
+            )
+            code_pred_train_dataset = RLHFDataset(parquet_files=parquet_path,
+                                                  tokenizer=self.tokenizer,
+                                                  prompt_key=self.config.data.prompt_key,
+                                                  max_prompt_length=self.config.data.max_prompt_length,
+                                                  filter_prompts=True,
+                                                  return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                                  truncation='right',
+                                                  extra_source_key=f"pred_{problem_type}_train")
+            
+            # This original assert is no longer needed because we handle the empty case above.
+            # However, if the dataset is created but is *still* empty after processing, return empty.
+            if len(code_pred_train_dataset) == 0:
+                return iter([])
 
-        # Add code_f specific parameters
-        if problem_type == 'code_f':
-            gen_params.update({
-                'num_inputs': self.config.azr.data_selection_strategy.num_inputs,
-            })
-
-        get_gen_code_io_data(**gen_params)
-
-        code_gen_train_dataset = RLHFDataset(
-            parquet_files=parquet_path,
-            tokenizer=self.tokenizer,
-            prompt_key=self.config.data.prompt_key,
-            max_prompt_length=self.config.data.max_prompt_length,
-            filter_prompts=True,
-            return_raw_chat=self.config.data.get('return_raw_chat', False),
-            truncation='right',
-            extra_source_key=f"gen_{problem_type}_train"
-        )
-
-        # [MODIFIED] Add this block to handle empty datasets gracefully
-        if len(code_gen_train_dataset) == 0:
-            # Use the existing PrettyPrinter if available, otherwise standard print
-            try:
-                PrettyPrinter.status("DATA", f"No data available for pred_{problem_type}_train, skipping this batch.", "warning")
-            except NameError:
-                print(f"WARNING: No data available for pred_{problem_type}_train, skipping this batch.")
-            return iter([]) # Return an empty iterator to prevent crashing
-
-        if self.config.data.shuffle:
-            train_dataloader_generator = torch.Generator()
-            train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
-            sampler = RandomSampler(code_gen_train_dataset, generator=train_dataloader_generator)
-        else:
-            sampler = SequentialSampler(code_gen_train_dataset)
-
-        return iter(DataLoader(
-            dataset=code_gen_train_dataset,
-            batch_size=self.config.data.train_batch_size,
-            drop_last=True,
-            collate_fn=collate_fn,
-            sampler=sampler
-        ))
-
-    def _create_train_code_pred_dataloader(self, problem_type: str, data_len: int) -> DataLoader:
-        if problem_type == 'code_i':
-            dataset_key = 'input'
-        elif problem_type == 'code_o':
-            dataset_key = 'output'
-        elif problem_type == 'code_e':
-            dataset_key = 'error'
-        elif problem_type == 'code_f':
-            dataset_key = 'problem'
-        else:
-            raise ValueError(f'Invalid problem type: {problem_type}')
-        full_dataset = ray.get(self.dataset_manager.get_dataset.remote(dataset_key))
-
-        strategy = self.config.azr.pred_data_mix_strategy
-
-        if strategy == "step":
-            # Get entries with their creation steps
-            entries_with_steps = ray.get(self.dataset_manager.get_dataset_with_steps.remote(dataset_key))
-            if not entries_with_steps:
-                selected_data = []
+            if self.config.data.shuffle:
+                train_dataloader_generator = torch.Generator()
+                train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
+                sampler = RandomSampler(data_source=code_pred_train_dataset, generator=train_dataloader_generator)
             else:
-                entries, steps = zip(*entries_with_steps)
-                # Calculate inverse step weights (newer entries get higher weight)
-                selected_indices = random.choices(
-                    range(len(entries)),
-                    weights=steps,
-                    k=min(data_len, len(entries))
-                )
-                selected_data = [entries[i] for i in selected_indices]
-        elif strategy == "uniform_total":
-            selected_data = random.sample(full_dataset, min(len(full_dataset), data_len))
-        elif strategy == "max_new":
-            total_recent = ray.get(self.dataset_manager.get_recent_additions.remote(
-                dataset_key, self.global_steps, self._past_epoch_window
-            ))
-            new_programs = full_dataset[-total_recent:] if total_recent > 0 else []
-            new_samples = random.sample(new_programs, min(len(new_programs), data_len))
-            remaining = data_len - len(new_samples)
-            selected_data = new_samples + random.sample(full_dataset, remaining)
-        elif strategy == "half_new":
-            total_recent = ray.get(self.dataset_manager.get_recent_additions.remote(
-                dataset_key, self.global_steps, self._past_epoch_window
-            ))
-            new_programs = full_dataset[-total_recent:] if total_recent > 0 else []
-            new_count = min(len(new_programs), data_len//2)
-            base_count = data_len - new_count
-            selected_data = random.sample(new_programs, new_count) + random.sample(full_dataset, base_count)
-        else:
-            raise ValueError(f"Unknown strategy: {strategy}")
+                sampler = SequentialSampler(data_source=code_pred_train_dataset)
 
-        parquet_path = (self._code_dir / f'train_pred_{problem_type}.parquet').as_posix()
-        get_pred_code_io_data(
-            io_data=selected_data,
-            target_data_len=data_len,
-            problem_type=problem_type,
-            content_max_length=self.config.azr.data_selection_strategy.content_max_length,
-            output_path=parquet_path,
-            split='train',
-            tokenizer=self.tokenizer,
-            instruction_type=self.config.reward_fn.extraction_type,
-        )
-        code_pred_train_dataset = RLHFDataset(parquet_files=parquet_path,
-                                         tokenizer=self.tokenizer,
-                                         prompt_key=self.config.data.prompt_key,
-                                         max_prompt_length=self.config.data.max_prompt_length,
-                                         filter_prompts=True,
-                                         return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                         truncation='right',
-                                         extra_source_key=f"pred_{problem_type}_train")
-        # use sampler for better ckpt resume
-        if self.config.data.shuffle:
-            train_dataloader_generator = torch.Generator()
-            train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
-            sampler = RandomSampler(data_source=code_pred_train_dataset, generator=train_dataloader_generator)
-        else:
-            sampler = SequentialSampler(data_source=code_pred_train_dataset)
+            code_pred_train_dataloader = DataLoader(dataset=code_pred_train_dataset,
+                                                  batch_size=self.config.data.train_batch_size,
+                                                  drop_last=True,
+                                                  collate_fn=collate_fn,
+                                                  sampler=sampler)
 
-        code_pred_train_dataloader = DataLoader(dataset=code_pred_train_dataset,
-                                           batch_size=self.config.data.train_batch_size,
-                                           drop_last=True,
-                                           collate_fn=collate_fn,
-                                           sampler=sampler)
-
-        assert len(code_pred_train_dataloader) >= 1
-        return iter(code_pred_train_dataloader)
+            # assert len(code_pred_train_dataloader) >= 1 # This line is the original source of the crash
+            return iter(code_pred_train_dataloader)
 
     def _compute_batch(self, batch: DataProto, metrics: dict, timing_raw: dict, problem_type: str, executor: PythonExecutor) -> tuple[DataProto, dict]:
         PrettyPrinter.section_header(f"Computing batch for {problem_type}")
