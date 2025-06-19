@@ -646,44 +646,6 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
         # Force garbage collection
         gc.collect()
 
-    def _replenish_dataset_if_needed(self, problem_type: str, required_size: int):
-        """
-        Checks a dataset pool and runs a targeted data generation if the
-        number of samples is below the required threshold.
-        """
-        if problem_type == 'code_i': dataset_key = 'input'
-        elif problem_type == 'code_o': dataset_key = 'output'
-        elif problem_type == 'code_e': dataset_key = 'error'
-        elif problem_type == 'code_f': dataset_key = 'problem'
-        else: return # Should not happen
-
-        try:
-            current_size = ray.get(self.dataset_manager.get_dataset_size.remote(dataset_key))
-            
-            if current_size < required_size:
-                print(f"⚠️ WARNING: Dataset '{dataset_key}' is low on data (has {current_size}, requires {required_size}).")
-                print(f"🚀 Triggering a targeted replenishment run for problem type '{problem_type}'...")
-
-                # Create a temporary dataloader with just enough prompts to generate new data
-                # This uses the same logic as your main loop but is more targeted
-                replenish_dataloader = self._create_train_code_gen_dataloader(
-                    problem_type=problem_type,
-                    data_len=required_size, # Generate enough to meet the minimum requirement
-                    seeding=True # Use seeding mode if it sources from a different pool
-                )
-                
-                # Consume the dataloader to trigger the generation and reward calculation
-                for batch_dict in replenish_dataloader:
-                    batch = DataProto.from_single_dict(batch_dict)
-                    # We only need to run the data generation part of the compute loop
-                    self._compute_batch(batch, {}, {}, problem_type=f'gen_{problem_type}', executor=self._executor)
-                
-                new_size = ray.get(self.dataset_manager.get_dataset_size.remote(dataset_key))
-                print(f"✅ Replenishment complete. Dataset '{dataset_key}' now has {new_size} samples.")
-        
-        except Exception as e:
-            print(f"❌ ERROR during '{dataset_key}' replenishment: {e}")
-
     # def _consolidate_model_weights(self, step: int, force: bool = False):
     #     """
     #     🔥 TRUE MODEL WEIGHT CONSOLIDATION
@@ -1737,17 +1699,6 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
 
             while self.global_steps < self.total_training_steps:
                 PrettyPrinter.section_header(f"Training Step {self.global_steps}")
-                
-                # --- START OF "JUST-IN-TIME" REPLENISHMENT ---
-                # Define the minimum number of samples each dataset should have before starting a step
-                required_samples = self.config.data.train_batch_size * self.config.azr.data_selection_strategy.update_iteration
-                
-                print("INFO: Checking data source levels before training step...")
-                for p_type in self.config.azr.problem_types:
-                    self._replenish_dataset_if_needed(problem_type=p_type, required_size=required_samples)
-                print("INFO: Data source checks complete.")
-                # --- END OF "JUST-IN-TIME" REPLENISHMENT ---
-
                 if self.config.azr.data_selection_strategy.composite_scheduler.enabled:
                     self.scheduler_step()
 
@@ -1822,7 +1773,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                                     batch: DataProto = DataProto.from_single_dict(batch_dict)
                                     batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_i', executor=self._executor)
                                     if self.config.azr.train_propose:
-                                        batches['gen_code_i'] = batch
+                                        batches[f'gen_code_i'] = batch
                                 except StopIteration:
                                     print(f"INFO: Dataloader for gen_code_i is exhausted at step {self.global_steps}. Skipping.")
                                     pass
@@ -1830,7 +1781,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                                 batch_dict = next(pred_code_i_dataloader)
                                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                                 batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='pred_code_i', executor=self._executor)
-                                batches['pred_code_i'] = batch
+                                batches[f'pred_code_i'] = batch
                             except StopIteration:
                                 print(f"INFO: Dataloader for pred_code_i is exhausted at step {self.global_steps}. Skipping.")
                                 pass
@@ -1842,7 +1793,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                                     batch: DataProto = DataProto.from_single_dict(batch_dict)
                                     batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_o', executor=self._executor)
                                     if self.config.azr.train_propose:
-                                        batches['gen_code_o'] = batch
+                                        batches[f'gen_code_o'] = batch
                                 except StopIteration:
                                     print(f"INFO: Dataloader for gen_code_o is exhausted at step {self.global_steps}. Skipping.")
                                     pass
@@ -1850,7 +1801,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                                 batch_dict = next(pred_code_o_dataloader)
                                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                                 batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='pred_code_o', executor=self._executor)
-                                batches['pred_code_o'] = batch
+                                batches[f'pred_code_o'] = batch
                             except StopIteration:
                                 print(f"INFO: Dataloader for pred_code_o is exhausted at step {self.global_steps}. Skipping.")
                                 pass
@@ -1862,7 +1813,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                                     batch: DataProto = DataProto.from_single_dict(batch_dict)
                                     batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_e', executor=self._executor)
                                     if self.config.azr.train_propose:
-                                        batches['gen_code_e'] = batch
+                                        batches[f'gen_code_e'] = batch
                                 except StopIteration:
                                     print(f"INFO: Dataloader for gen_code_e is exhausted at step {self.global_steps}. Skipping.")
                                     pass
@@ -1870,7 +1821,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                                 batch_dict = next(pred_code_e_dataloader)
                                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                                 batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='pred_code_e', executor=self._executor)
-                                batches['pred_code_e'] = batch
+                                batches[f'pred_code_e'] = batch
                             except StopIteration:
                                 print(f"INFO: Dataloader for pred_code_e is exhausted at step {self.global_steps}. Skipping.")
                                 pass
@@ -1882,7 +1833,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                                     batch: DataProto = DataProto.from_single_dict(batch_dict)
                                     batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_f', executor=self._executor)
                                     if self.config.azr.train_propose:
-                                        batches['gen_code_f'] = batch
+                                        batches[f'gen_code_f'] = batch
                                 except StopIteration:
                                     print(f"INFO: Dataloader for gen_code_f is exhausted at step {self.global_steps}. Skipping.")
                                     pass
@@ -1890,13 +1841,13 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                                 batch_dict = next(pred_code_f_dataloader)
                                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                                 batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='pred_code_f', executor=self._executor)
-                                batches['pred_code_f'] = batch
+                                batches[f'pred_code_f'] = batch
                             except StopIteration:
                                 print(f"INFO: Dataloader for pred_code_f is exhausted at step {self.global_steps}. Skipping.")
                                 pass
                         
                         if not batches:
-                            print(f"WARNING: All dataloaders exhausted for this iteration. Continuing to next training step.")
+                            print(f"WARNING: All dataloaders exhausted for iteration. Continuing to next training step.")
                             continue
                         
                         batch = DataProto.concat(list(batches.values()))
@@ -1955,11 +1906,18 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                             with _timer('save_checkpoint', timing_raw):
                                 self._save_checkpoint()
 
+                        # collect metrics, separate problem types
+                    
+                        # IMPORTANT FIX: Instead of rebuilding the list of all possible types,
+                        # we get the list of types that were ACTUALLY added to the `batches` dict.
+                        # This ensures the number of chunks matches the concatenated data.
                         actual_types_in_batch = list(batches.keys())
                         
                         if batches:
+                            # Chunk the batch by the number of successful dataloader operations
                             sep_batches = batch.chunk(len(actual_types_in_batch))
                             
+                            # Zip the chunks with the list of actual types
                             for sep_batch, problem_type in zip(sep_batches, actual_types_in_batch):
                                 sep_metrics = compute_data_metrics(batch=sep_batch, use_critic=self.use_critic, tokenizer=self.tokenizer)
                                 sep_metrics = {f'{problem_type}/{k}': v for k, v in sep_metrics.items()}
