@@ -72,6 +72,14 @@ def main():
             env["AZR_TARGET_STEPS"] = str(target_step)
             env["AZR_CYCLE_NUM"] = str(cycle_num)
 
+            # ======================== START: THE BRUTE FORCE FIX ========================
+            # Explicitly put your project directory at the front of the Python path.
+            # This forces Python to look here first for any imports.
+            project_root = "/home/frankshortt/AI/qwen3-training/Absolute-Zero-Reasoner"
+            env["PYTHONPATH"] = f"{project_root}:{env.get('PYTHONPATH', '')}"
+            # print(f"--- FORCE-INJECTING PYTHONPATH: {env['PYTHONPATH']}")
+            # ========================= END: THE BRUTE FORCE FIX =========================
+
             run_command(f"bash {TRAINING_SCRIPT_PATH}", env=env)
 
         print(f"\n--- VALIDATING CHECKPOINT FOR CYCLE {cycle_num} ---")

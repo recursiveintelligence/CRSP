@@ -683,6 +683,43 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
     #             PrettyPrinter.status("CONSOLIDATION", f"❌ Failed: {str(e)}", "error")
     #             traceback.print_exc()
 
+    def _replenish_dataset_if_needed(self, problem_type: str, required_size: int):
+        """
+        Checks a dataset pool and runs a targeted data generation if the
+        number of samples is below the required threshold.
+        """
+        if problem_type == 'code_i': dataset_key = 'input'
+        elif problem_type == 'code_o': dataset_key = 'output'
+        elif problem_type == 'code_e': dataset_key = 'error'
+        elif problem_type == 'code_f': dataset_key = 'problem'
+        else: return
+
+        try:
+            current_size = ray.get(self.dataset_manager.get_dataset_size.remote(dataset_key))
+
+            if current_size < required_size:
+                num_to_generate = required_size - current_size
+                PrettyPrinter.status("REPLENISH", f"Dataset '{dataset_key}' is low (has {current_size}, requires {required_size}). Generating {num_to_generate} new samples...", "warning")
+
+                # This dataloader uses the 'seed' datasets to generate new prompts
+                replenish_dataloader = self._create_train_code_gen_dataloader(
+                    problem_type=problem_type,
+                    data_len=num_to_generate,
+                    seeding=True
+                )
+
+                # Consume the dataloader to trigger generation and add data back to the manager
+                for batch_dict in replenish_dataloader:
+                    batch = DataProto.from_single_dict(batch_dict)
+                    self._compute_batch(batch, {}, {}, problem_type=f'gen_{problem_type}', executor=self._executor)
+
+                new_size = ray.get(self.dataset_manager.get_dataset_size.remote(dataset_key))
+                PrettyPrinter.status("REPLENISH", f"Replenishment complete. Dataset '{dataset_key}' now has {new_size} samples.", "success")
+
+        except Exception as e:
+            print(f"   ❌ ERROR during '{dataset_key}' replenishment: {e}")
+            traceback.print_exc()
+
     def _create_train_code_gen_dataloader(
             self,
             problem_type: str,
@@ -705,12 +742,17 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             if problem_type != 'code_f':
                 io_data = ray.get(self.dataset_manager.get_dataset.remote(dataset_key))
 
-            # --- RESILIENCY FIX START ---
-            # Before doing any work, check if the source data is empty.
-            if not io_data:
-                print(f"INFO: Source dataset '{dataset_key}' for gen_{problem_type} is empty at step {self.global_steps}. Returning empty dataloader.")
-                return iter([]) # Return an empty, safe iterator immediately
-            # --- RESILIENCY FIX END ---
+
+            # ============================ START: FIX ============================
+            # This check is more robust than just checking `if not io_data` because it
+            # checks if you have enough data for the requested batch size (`data_len`).
+            if len(io_data) < data_len:
+                raise ValueError(
+                    f"DATA DEPLETION: Required {data_len} samples for gen_{problem_type}, "
+                    f"but dataset '{dataset_key}' only has {len(io_data)}. "
+                    f"Aborting at step {self.global_steps} before crash."
+                )
+            # ============================= END: FIX =============================
 
             parquet_path = (self._code_dir / f'train_gen_{problem_type}.parquet').as_posix()
             os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
@@ -802,12 +844,15 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             
             full_dataset = ray.get(self.dataset_manager.get_dataset.remote(dataset_key))
 
-            # --- RESILIENCY FIX START ---
-            # Before doing any work, check if the source data is empty.
-            if not full_dataset:
-                print(f"INFO: Source dataset '{dataset_key}' for pred_{problem_type} is empty at step {self.global_steps}. Returning empty dataloader.")
-                return iter([]) # Return an empty, safe iterator immediately
-            # --- RESILIENCY FIX END ---
+            # ============================ START: FIX ============================
+            # Check if the entire pool is empty or has fewer samples than required.
+            if len(full_dataset) < data_len:
+                raise ValueError(
+                    f"DATA DEPLETION: Required {data_len} samples for pred_{problem_type}, "
+                    f"but dataset '{dataset_key}' only has {len(full_dataset)}. "
+                    f"Aborting at step {self.global_steps} before crash."
+                )
+            # ============================= END: FIX =============================
 
             strategy = self.config.azr.pred_data_mix_strategy
 
@@ -1699,6 +1744,15 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
 
             while self.global_steps < self.total_training_steps:
                 PrettyPrinter.section_header(f"Training Step {self.global_steps}")
+
+                # ===================== ADD THE JUST-IN-TIME CHECK HERE =====================
+                required_samples = self.config.data.train_batch_size * self.config.azr.data_selection_strategy.update_iteration
+                
+                # Check data levels for each problem type before creating training batches
+                for p_type in self.config.azr.problem_types:
+                    self._replenish_dataset_if_needed(problem_type=p_type, required_size=required_samples)
+                # =========================================================================
+                
                 if self.config.azr.data_selection_strategy.composite_scheduler.enabled:
                     self.scheduler_step()
 
@@ -1978,15 +2032,15 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                         gc.collect()
 
                         if self.global_steps >= self.total_training_steps:
-                            if self.val_reward_fn is not None:
-                                PrettyPrinter.section_header(f"Starting Final Validation")
-                                val_metrics = self._validate()
-                                PrettyPrinter.table(
-                                    ["Data Source", "Average Score"],
-                                    [[k, v] for k, v in val_metrics.items()],
-                                    title="Final Validation Results"
-                                )
-                                logger.log(data=val_metrics, step=self.global_steps)
+                            # if self.val_reward_fn is not None:
+                            #     PrettyPrinter.section_header(f"Starting Final Validation")
+                            #     val_metrics = self._validate()
+                            #     PrettyPrinter.table(
+                            #         ["Data Source", "Average Score"],
+                            #         [[k, v] for k, v in val_metrics.items()],
+                            #         title="Final Validation Results"
+                            #     )
+                            #     logger.log(data=val_metrics, step=self.global_steps)
                             if self.config.trainer.save_freq > 0 and \
                                     (self.global_steps - 1) % self.config.trainer.save_freq != 0:
                                 with _timer('save_checkpoint', timing_raw):
