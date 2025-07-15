@@ -1,0 +1,6 @@
+{
+    "question": "Find the last three digits of the product of the positive roots of $\\sqrt{1995}x^{\\log_{1995}x}=x^2.$",
+    "solution": "Okay, so I need to find the last three digits of the product of the positive roots of the equation √(1995) * x^(log_{1995} x) = x². ... [full step-by-step derivation omitted for brevity] ... Therefore, the final answer is \\boxed{025}.",
+    "answer": "25"
+  }
+  
