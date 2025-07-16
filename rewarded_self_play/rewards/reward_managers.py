@@ -449,6 +449,14 @@ class CodeIORewardManager():
         self.alpha_scheduler = AlphaDecayScheduler()
         self.crsp_logger = CRSPLogger(output_path, log_level="INFO")
         
+        # Memory optimization settings
+        self.reward_batch_size = getattr(generation_reward_config, 'reward_batch_size', 16)
+        self.enable_streaming = getattr(generation_reward_config, 'enable_streaming', True)
+        
+        # Pre-allocated tensors for memory efficiency
+        self._reward_buffers = {}
+        self._token_cache = {}  # Cache for tokenized content
+        
         # Initialize running statistics for reward normalization
         self.running_stats = {
             'correctness': {'mean': 0.5, 'std': 0.5},
@@ -688,10 +696,9 @@ class CodeIORewardManager():
         
         return normalized_rewards
 
-    @staticmethod
-    def compute_length_reward(solution_text: str, tokenizer: AutoTokenizer, max_length: int = 2048, penalty_threshold: int = 4096) -> float:
+    def compute_length_reward(self, solution_text: str, tokenizer: AutoTokenizer, max_length: int = 2048, penalty_threshold: int = 4096) -> float:
         """
-        Compute length-based reward following RLSP logic.
+        Compute length-based reward following RLSP logic with memory optimization.
         Encourages thoughtful reasoning chains while preventing excessive verbosity.
         
         Args:
@@ -705,33 +712,80 @@ class CodeIORewardManager():
         """
         import math
         
-        # Extract thinking content from <think> tags if present
-        think_pattern = r'<think>(.*?)</think>'
-        think_matches = re.findall(think_pattern, solution_text, re.DOTALL)
-        
-        if think_matches:
-            # Use the thinking content for length calculation
-            reasoning_text = think_matches[0].strip()
+        # Check cache first for memory efficiency
+        text_hash = hash(solution_text)
+        if hasattr(self, '_token_cache') and text_hash in self._token_cache:
+            token_count = self._token_cache[text_hash]
         else:
-            # Use the full solution text
-            reasoning_text = solution_text.strip()
-        
-        # Count tokens
-        tokens = tokenizer.encode(reasoning_text)
-        token_count = len(tokens)
+            # Extract thinking content efficiently without regex compilation
+            reasoning_text = self.extract_think_content_fast(solution_text)
+            
+            # Efficient tokenization - avoid creating full token list if possible
+            if hasattr(tokenizer, 'count_tokens'):
+                token_count = tokenizer.count_tokens(reasoning_text)
+            else:
+                # Use efficient encoding without storing tokens
+                encoding = tokenizer(
+                    reasoning_text, 
+                    add_special_tokens=False,
+                    return_tensors=None,
+                    return_length=True
+                )
+                token_count = len(encoding['input_ids']) if 'input_ids' in encoding else 0
+            
+            # Cache result with size limit
+            if hasattr(self, '_token_cache'):
+                self._token_cache[text_hash] = token_count
+                
+                # Limit cache size to prevent memory growth
+                if len(self._token_cache) > 1000:
+                    # Remove oldest entries (simple FIFO)
+                    oldest_keys = list(self._token_cache.keys())[:500]
+                    for key in oldest_keys:
+                        del self._token_cache[key]
         
         if token_count == 0:
             return 0.0
         
-        # Logarithmic scaling up to max_length
-        length_reward = min(1.0, math.log(token_count + 1) / math.log(max_length))
+        # Use lookup table for common logarithms to avoid repeated computation
+        if not hasattr(self, '_log_lookup'):
+            self._log_lookup = {i: math.log(i) for i in range(1, 10000)}
+            self._log_max_length = math.log(max_length)
         
-        # Apply penalty for excessive length
+        # Efficient logarithmic scaling
+        log_tokens = self._log_lookup.get(token_count, math.log(token_count))
+        length_reward = min(1.0, log_tokens / self._log_max_length)
+        
+        # Fast penalty computation
         if token_count > penalty_threshold:
-            penalty_factor = math.exp(-(token_count - penalty_threshold) / penalty_threshold)
-            length_reward *= penalty_factor
+            penalty_exp = -(token_count - penalty_threshold) / penalty_threshold
+            # Avoid expensive exp computation for very negative values
+            length_reward *= math.exp(penalty_exp) if penalty_exp > -10 else 0.0
         
         return length_reward
+    
+    def extract_think_content_fast(self, solution_text: str) -> str:
+        """
+        Fast extraction of think content without regex compilation.
+        
+        Args:
+            solution_text: The solution text to process
+            
+        Returns:
+            Extracted thinking content or full text if no tags found
+        """
+        start_tag = '<think>'
+        end_tag = '</think>'
+        
+        start_idx = solution_text.find(start_tag)
+        if start_idx == -1:
+            return solution_text.strip()
+        
+        end_idx = solution_text.find(end_tag, start_idx)
+        if end_idx == -1:
+            return solution_text[start_idx + len(start_tag):].strip()
+        
+        return solution_text[start_idx + len(start_tag):end_idx].strip()
 
     @staticmethod
     def extract_input_output(extracted_content: str, return_input: bool = True, return_output: bool = False) -> Tuple[str, str]:
