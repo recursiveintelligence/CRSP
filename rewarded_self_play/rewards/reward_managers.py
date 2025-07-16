@@ -1046,11 +1046,34 @@ class CodeIORewardManager():
                 error_type_counters=error_type_counters,
             )
             PrettyPrinter.section_header("Combining Rewards for Generation Tasks")
+            
+            # Display detailed reward breakdown for transparency
+            PrettyPrinter.info("REWARD", "Detailed reward breakdown:")
+            for uid in rewards:
+                reward_data = rewards[uid]
+                PrettyPrinter.info("REWARD", f"UID {uid[:8]}...")
+                PrettyPrinter.info("REWARD", f"  ├─ Accuracy: {reward_data['accuracy']:.4f}")
+                if 'complexity' in reward_data:
+                    PrettyPrinter.info("REWARD", f"  ├─ Complexity: {reward_data['complexity']:.4f}")
+                if 'mean_edit_distance' in reward_data:
+                    PrettyPrinter.info("REWARD", f"  ├─ Edit Distance: {reward_data['mean_edit_distance']:.4f}")
+                if 'halstead' in reward_data:
+                    PrettyPrinter.info("REWARD", f"  ├─ Halstead: {reward_data['halstead']:.4f}")
+                if 'type_counts' in reward_data:
+                    PrettyPrinter.info("REWARD", f"  ├─ Type Diversity: {reward_data['type_counts']:.4f}")
+                if 'input_type_counts' in reward_data:
+                    PrettyPrinter.info("REWARD", f"  ├─ Input Type Diversity: {reward_data['input_type_counts']:.4f}")
+                if 'output_type_counts' in reward_data:
+                    PrettyPrinter.info("REWARD", f"  └─ Output Type Diversity: {reward_data['output_type_counts']:.4f}")
+            
             for i in range(len(data_dicts)):
                 uid = data_dicts[i]['uid']
                 valid_response_length = data_dicts[i]['valid_response_length']
                 acc_reward = rewards[uid]['accuracy']
                 format_reward = data_dicts[i]['format_score']
+                
+                PrettyPrinter.info("REWARD", f"Sample {i+1}: Format={format_reward:.2f}, Accuracy={acc_reward:.4f}")
+                
                 if format_reward > 0:
                     if acc_reward > 0:
                         # Helper function for safe reward combination
@@ -1090,8 +1113,41 @@ class CodeIORewardManager():
                                 intrinsic_reward_components.append(min(self.generation_reward_config.answer_diversity_reward.coef * rewards[uid]['type_counts'],
                                     self.generation_reward_config.answer_diversity_reward.max))
 
+                        # Compute CRSP rewards (length, creativity, critique)
+                        generation_text = data_dicts[i].get('generation', '')
+                        crsp_rewards = self.compute_crsp_rewards(
+                            data_dict={'generation': generation_text}, 
+                            correctness_score=acc_reward
+                        )
+                        
+                        # Display CRSP reward breakdown
+                        PrettyPrinter.section_header("CRSP REWARD BREAKDOWN")
+                        PrettyPrinter.info("CRSP", f"Sample {i+1} CRSP Analysis:")
+                        PrettyPrinter.info("CRSP", f"  ├─ Correctness: {crsp_rewards['correctness']:.4f}")
+                        PrettyPrinter.info("CRSP", f"  ├─ Length Reward: {crsp_rewards['length_reward']:.4f}")
+                        PrettyPrinter.info("CRSP", f"  ├─ Creativity Reward: {crsp_rewards['creativity_reward']:.4f}")
+                        PrettyPrinter.info("CRSP", f"  ├─ Agreement Score: {crsp_rewards['agreement_score']:.4f}")
+                        PrettyPrinter.info("CRSP", f"  ├─ Alpha S (Solver): {crsp_rewards['alpha_s']:.4f}")
+                        PrettyPrinter.info("CRSP", f"  ├─ Alpha C (Critique): {crsp_rewards['alpha_c']:.4f}")
+                        PrettyPrinter.info("CRSP", f"  ├─ Solver Reward: {crsp_rewards['solver_reward']:.4f}")
+                        PrettyPrinter.info("CRSP", f"  └─ Critique Reward: {crsp_rewards['critique_reward']:.4f}")
+                        
+                        # Combine traditional intrinsic rewards with CRSP rewards
                         final_reward = _combine_rewards(acc_reward, intrinsic_reward_components, self.generation_reward_config.intrinsic_combine_method)
-                        reward_tensor[i, valid_response_length - 1] = final_reward
+                        
+                        # Add CRSP enhancement to final reward
+                        crsp_enhanced_reward = final_reward + 0.1 * crsp_rewards['solver_reward'] + 0.05 * crsp_rewards['critique_reward']
+                        
+                        reward_tensor[i, valid_response_length - 1] = crsp_enhanced_reward
+                        
+                        # Display comprehensive final reward computation
+                        PrettyPrinter.info("REWARD", f"Sample {i+1} COMPREHENSIVE FINAL REWARD: {crsp_enhanced_reward:.4f}")
+                        PrettyPrinter.info("REWARD", f"  ├─ Base Accuracy: {acc_reward:.4f}")
+                        PrettyPrinter.info("REWARD", f"  ├─ Intrinsic Components: {intrinsic_reward_components}")
+                        PrettyPrinter.info("REWARD", f"  ├─ Traditional Combined: {final_reward:.4f}")
+                        PrettyPrinter.info("REWARD", f"  ├─ CRSP Solver Bonus: {0.1 * crsp_rewards['solver_reward']:.4f}")
+                        PrettyPrinter.info("REWARD", f"  ├─ CRSP Critique Bonus: {0.05 * crsp_rewards['critique_reward']:.4f}")
+                        PrettyPrinter.info("REWARD", f"  └─ CRSP Enhanced Final: {crsp_enhanced_reward:.4f}")
                     else:
                         reward_tensor[i, valid_response_length - 1] = -0.5
                 else:
@@ -1108,6 +1164,7 @@ class CodeIORewardManager():
                 all_scores['output_answer_diversity'] = [rewards[uid]['output_type_counts'] for uid in rewards]
         elif problem_type.startswith('pred'): # get prediction rewards
             PrettyPrinter.section_header("Getting Prediction Rewards")
+            PrettyPrinter.info("REWARD", f"Processing {len(data_dicts)} prediction samples for {problem_type}")
             all_scores['none_count'] = 0
             acc_rewards = []
             for i, data_dict in enumerate(data_dicts):
@@ -1170,6 +1227,16 @@ class CodeIORewardManager():
                         correct_predictions.append(data_dict)
                 else:
                     raise ValueError(f"Invalid problem type: {problem_types[i]}")
+
+                # Display detailed prediction reward
+                PrettyPrinter.info("REWARD", f"Sample {i+1} PREDICTION REWARD:")
+                PrettyPrinter.info("REWARD", f"  ├─ Problem Type: {problem_types[i]}")
+                PrettyPrinter.info("REWARD", f"  ├─ Format Score: {data_dicts[i]['format_score']:.2f}")
+                PrettyPrinter.info("REWARD", f"  ├─ Accuracy Reward: {acc_reward:.4f}")
+                if problem_types[i].endswith('code_f') and input_output_accs:
+                    PrettyPrinter.info("REWARD", f"  ├─ Individual I/O Accuracies: {[f'{acc:.2f}' for acc in input_output_accs]}")
+                    PrettyPrinter.info("REWARD", f"  ├─ Reward Type: {self.code_f_reward_type}")
+                PrettyPrinter.info("REWARD", f"  └─ Correct: {'Yes' if acc_reward > 0 else 'No'}")
 
                 if self.split == 'train':
                     if data_dicts[i]['format_score'] > 0:

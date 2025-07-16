@@ -1759,6 +1759,102 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
+                        
+                        # TR-RPG Integration - Display critique policy outputs and TR-RPG metrics
+                        PrettyPrinter.section_header("TR-RPG POLICY ANALYSIS")
+                        
+                        # Extract policy-specific rewards from batch
+                        policy_rewards = {}
+                        for i, problem_type in enumerate(all_types):
+                            if 'gen' in problem_type:
+                                policy_rewards['propose'] = batch.batch['token_level_rewards'][i::len(all_types)]
+                            elif 'pred' in problem_type:
+                                policy_rewards['solve'] = batch.batch['token_level_rewards'][i::len(all_types)]
+                        
+                        # Compute actual critique policy rewards based on CRSP framework
+                        if 'solve' in policy_rewards:
+                            # Extract actual critique metrics from batch data
+                            critique_rewards = []
+                            length_rewards = []
+                            creativity_rewards = []
+                            
+                            for i in range(len(batch)):
+                                data_item = batch[i]
+                                response_ids = data_item.batch['responses']
+                                valid_length = data_item.batch['attention_mask'].sum().item()
+                                
+                                # Decode response for analysis
+                                response_text = self.tokenizer.decode(response_ids[:valid_length], skip_special_tokens=True)
+                                
+                                # Compute length reward
+                                length_reward = self.reward_fn.compute_length_reward(response_text, self.tokenizer)
+                                length_rewards.append(length_reward)
+                                
+                                # Compute creativity reward  
+                                creativity_reward = self.reward_fn.critique_manager.compute_creativity_reward(response_text)
+                                creativity_rewards.append(creativity_reward)
+                                
+                                # Compute critique reward (agreement + creativity)
+                                correctness = data_item.batch['token_level_rewards'].sum().item() > 0
+                                agreement_score = 1.0 if correctness else 0.0
+                                alpha_s, alpha_c = self.reward_fn.alpha_scheduler.compute_alpha_decay(
+                                    self.global_steps, self.total_training_steps
+                                )
+                                critique_reward = alpha_c * agreement_score + (1 - alpha_c) * creativity_reward
+                                critique_rewards.append(critique_reward)
+                            
+                            policy_rewards['critique'] = torch.tensor(critique_rewards)
+                            
+                            # Display detailed CRSP metrics
+                            PrettyPrinter.section_header("CRSP DETAILED METRICS")
+                            PrettyPrinter.info("CRSP", f"LENGTH REWARDS:")
+                            PrettyPrinter.info("CRSP", f"  ├─ Mean: {np.mean(length_rewards):.4f}")
+                            PrettyPrinter.info("CRSP", f"  ├─ Std: {np.std(length_rewards):.4f}")
+                            PrettyPrinter.info("CRSP", f"  ├─ Min: {np.min(length_rewards):.4f}")
+                            PrettyPrinter.info("CRSP", f"  └─ Max: {np.max(length_rewards):.4f}")
+                            
+                            PrettyPrinter.info("CRSP", f"CREATIVITY REWARDS:")
+                            PrettyPrinter.info("CRSP", f"  ├─ Mean: {np.mean(creativity_rewards):.4f}")
+                            PrettyPrinter.info("CRSP", f"  ├─ Std: {np.std(creativity_rewards):.4f}")
+                            PrettyPrinter.info("CRSP", f"  ├─ Min: {np.min(creativity_rewards):.4f}")
+                            PrettyPrinter.info("CRSP", f"  └─ Max: {np.max(creativity_rewards):.4f}")
+                            
+                            PrettyPrinter.info("CRSP", f"ALPHA DECAY SCHEDULE:")
+                            PrettyPrinter.info("CRSP", f"  ├─ Current Step: {self.global_steps}")
+                            PrettyPrinter.info("CRSP", f"  ├─ Total Steps: {self.total_training_steps}")
+                            PrettyPrinter.info("CRSP", f"  ├─ Progress: {self.global_steps/self.total_training_steps:.2%}")
+                            PrettyPrinter.info("CRSP", f"  ├─ Alpha S (Solver): {alpha_s:.4f}")
+                            PrettyPrinter.info("CRSP", f"  └─ Alpha C (Critique): {alpha_c:.4f}")
+                            
+                            # Add CRSP metrics to overall metrics
+                            metrics.update({
+                                'crsp/length_reward_mean': np.mean(length_rewards),
+                                'crsp/length_reward_std': np.std(length_rewards),
+                                'crsp/creativity_reward_mean': np.mean(creativity_rewards),
+                                'crsp/creativity_reward_std': np.std(creativity_rewards),
+                                'crsp/alpha_s': alpha_s,
+                                'crsp/alpha_c': alpha_c,
+                                'crsp/training_progress': self.global_steps/self.total_training_steps
+                            })
+                        
+                        # Display detailed policy outputs
+                        for policy_name, rewards in policy_rewards.items():
+                            if len(rewards) > 0:
+                                PrettyPrinter.info("TR-RPG", f"{policy_name.upper()} POLICY:")
+                                PrettyPrinter.info("TR-RPG", f"  ├─ Reward Mean: {torch.mean(rewards).item():.4f}")
+                                PrettyPrinter.info("TR-RPG", f"  ├─ Reward Std: {torch.std(rewards).item():.4f}")
+                                PrettyPrinter.info("TR-RPG", f"  ├─ Reward Min: {torch.min(rewards).item():.4f}")
+                                PrettyPrinter.info("TR-RPG", f"  ├─ Reward Max: {torch.max(rewards).item():.4f}")
+                                PrettyPrinter.info("TR-RPG", f"  └─ Sample Count: {len(rewards)}")
+                        
+                        # Get TR-RPG training metrics
+                        tr_rpg_metrics = self.tr_rpg_trainer.get_training_metrics()
+                        PrettyPrinter.info("TR-RPG", "TRAINING METRICS:")
+                        for metric_name, metric_value in tr_rpg_metrics.items():
+                            PrettyPrinter.info("TR-RPG", f"  ├─ {metric_name}: {metric_value:.6f}")
+                        
+                        # Add TR-RPG metrics to overall metrics
+                        metrics.update({f"tr_rpg/{k}": v for k, v in tr_rpg_metrics.items()})
 
                     # validate
                     PrettyPrinter.section_header(f"Starting Validation")
