@@ -637,18 +637,77 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
         # Initialize dynamic batch size controller for memory optimization
         memory_config = MemoryOptimizationConfig(
             initial_batch_size=getattr(self.config.data, 'train_batch_size', 64),
-            min_batch_size=8,
+            min_batch_size=4,  # More aggressive minimum
             max_batch_size=getattr(self.config.data, 'train_batch_size', 64),
-            memory_warning_threshold=0.85,
-            memory_critical_threshold=0.95,
+            memory_warning_threshold=0.80,  # More conservative threshold
+            memory_critical_threshold=0.90,  # More conservative threshold
             enable_memory_monitoring=True,
-            max_oom_retries=3,
-            oom_cooldown_steps=10
+            max_oom_retries=5,  # More retries
+            oom_cooldown_steps=5,  # Shorter cooldown
+            batch_size_reduction_factor=0.5,  # More aggressive reduction
+            enable_aggressive_cleanup=True
         )
         self.batch_controller = DynamicBatchSizeController(memory_config)
         self.memory_processor = create_memory_optimized_batch_processor()[1]
         
+        # Perform initial memory cleanup
+        self._aggressive_memory_cleanup()
+        
+        # Apply immediate memory optimizations
+        self._apply_immediate_memory_optimizations()
+        
         PrettyPrinter.status("Memory", f"Initialized dynamic batch size controller with initial size: {memory_config.initial_batch_size}", "info")
+
+    def _apply_immediate_memory_optimizations(self):
+        """Apply immediate memory optimizations to reduce memory usage."""
+        try:
+            # Set PyTorch memory management settings
+            if torch.cuda.is_available():
+                # Enable memory-efficient attention if available
+                try:
+                    torch.backends.cuda.enable_flash_sdp(True)
+                    torch.backends.cuda.enable_mem_efficient_sdp(True)
+                    torch.backends.cuda.enable_math_sdp(False)  # Disable less efficient attention
+                    PrettyPrinter.status("Memory", "Enabled memory-efficient attention", "info")
+                except:
+                    pass  # Not all PyTorch versions support this
+                
+                # Set memory fraction to be more conservative
+                try:
+                    torch.cuda.set_per_process_memory_fraction(0.85)  # Use 85% of GPU memory max
+                    PrettyPrinter.status("Memory", "Set conservative GPU memory fraction (85%)", "info")
+                except:
+                    pass
+                
+                # Enable memory pool optimization
+                try:
+                    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+                    PrettyPrinter.status("Memory", "Enabled expandable memory segments", "info")
+                except:
+                    pass
+            
+            # Set environment variables for better memory management
+            os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Reduce tokenizer memory usage
+            
+            PrettyPrinter.status("Memory", "Applied immediate memory optimizations", "success")
+            
+        except Exception as e:
+            PrettyPrinter.status("Memory", f"Error applying memory optimizations: {str(e)[:100]}...", "warning")
+
+    def _aggressive_memory_cleanup(self):
+        """Perform aggressive memory cleanup to free up GPU memory."""
+        try:
+            # Clear PyTorch cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            # Force garbage collection
+            gc.collect()
+            
+            PrettyPrinter.status("Memory", "Performed aggressive memory cleanup", "info")
+        except Exception as e:
+            PrettyPrinter.status("Memory", f"Error during memory cleanup: {str(e)[:100]}...", "warning")
 
     def get_current_batch_config(self) -> Dict[str, int]:
         """Get current batch size configuration from the dynamic controller."""
@@ -656,24 +715,36 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
     
     def log_memory_statistics(self):
         """Log current memory statistics and controller status."""
-        stats = self.batch_controller.get_statistics()
-        
-        PrettyPrinter.section_header("MEMORY OPTIMIZATION STATUS")
-        PrettyPrinter.status("Memory", f"Current batch size: {stats['current_batch_size']}", "info")
-        PrettyPrinter.status("Memory", f"Gradient accumulation: {stats['gradient_accumulation_steps']}", "info")
-        PrettyPrinter.status("Memory", f"Effective batch size: {stats['effective_batch_size']}", "info")
-        PrettyPrinter.status("Memory", f"OOM events: {stats['oom_events']}", "warning" if stats['oom_events'] > 0 else "info")
-        PrettyPrinter.status("Memory", f"Consecutive successes: {stats['consecutive_successes']}", "success")
-        
-        gpu_info = stats['memory']['gpu']
-        PrettyPrinter.status("Memory", 
-            f"GPU Memory: {gpu_info['allocated']:.2f}GB/{gpu_info['total']:.2f}GB "
-            f"({gpu_info['utilization']*100:.1f}%)", 
-            "warning" if gpu_info['utilization'] > 0.85 else "info"
-        )
-        
-        if stats['avg_throughput'] > 0:
-            PrettyPrinter.status("Memory", f"Avg throughput: {stats['avg_throughput']:.2f} samples/sec", "info")
+        try:
+            stats = self.batch_controller.get_statistics()
+            
+            PrettyPrinter.section_header("MEMORY OPTIMIZATION STATUS")
+            PrettyPrinter.status("Memory", f"Current batch size: {stats.get('current_batch_size', 'N/A')}", "info")
+            PrettyPrinter.status("Memory", f"Gradient accumulation: {stats.get('gradient_accumulation_steps', 'N/A')}", "info")
+            PrettyPrinter.status("Memory", f"Effective batch size: {stats.get('effective_batch_size', 'N/A')}", "info")
+            PrettyPrinter.status("Memory", f"OOM events: {stats.get('oom_events', 0)}", "warning" if stats.get('oom_events', 0) > 0 else "info")
+            PrettyPrinter.status("Memory", f"Consecutive successes: {stats.get('consecutive_successes', 0)}", "success")
+            
+            # Safely access GPU memory info
+            if 'memory' in stats and 'gpu' in stats['memory']:
+                gpu_info = stats['memory']['gpu']
+                gpu_allocated = gpu_info.get('allocated', 0.0)
+                gpu_total = gpu_info.get('total', 0.0)
+                gpu_utilization = gpu_info.get('utilization', 0.0)
+                
+                PrettyPrinter.status("Memory", 
+                    f"GPU Memory: {gpu_allocated:.2f}GB/{gpu_total:.2f}GB "
+                    f"({gpu_utilization*100:.1f}%)", 
+                    "warning" if gpu_utilization > 0.85 else "info"
+                )
+            else:
+                PrettyPrinter.status("Memory", "GPU Memory: Unable to retrieve", "warning")
+            
+            if stats.get('avg_throughput', 0) > 0:
+                PrettyPrinter.status("Memory", f"Avg throughput: {stats['avg_throughput']:.2f} samples/sec", "info")
+                
+        except Exception as e:
+            PrettyPrinter.status("Memory", f"Error logging memory statistics: {str(e)[:100]}...", "error")
 
     def _update_actor_with_oom_handling(self, batch: DataProto, timing_raw: dict):
         """

@@ -138,17 +138,32 @@ class MemoryMonitor:
     
     def log_memory_stats(self, prefix: str = ""):
         """Log current memory statistics."""
-        stats = self.update_memory_stats()
-        gpu = stats["gpu"]
-        system = stats["system"]
-        
-        logger.info(
-            f"{prefix}Memory Stats - "
-            f"GPU: {gpu['allocated']:.2f}GB/{gpu['total']:.2f}GB "
-            f"({gpu['utilization']*100:.1f}%), "
-            f"System: {system['used']:.2f}GB/{system['total']:.2f}GB "
-            f"({system['utilization']*100:.1f}%)"
-        )
+        try:
+            stats = self.update_memory_stats()
+            gpu = stats["gpu"]
+            system = stats["system"]
+            
+            # Safely access GPU memory info with fallbacks
+            gpu_allocated = gpu.get('allocated', 0.0)
+            gpu_total = gpu.get('total', 0.0)
+            gpu_utilization = gpu.get('utilization', 0.0)
+            
+            # Safely access system memory info with fallbacks
+            system_used = system.get('used', 0.0)
+            system_total = system.get('total', 0.0)
+            system_utilization = system.get('utilization', 0.0)
+            
+            logger.info(
+                f"{prefix}Memory Stats - "
+                f"GPU: {gpu_allocated:.2f}GB/{gpu_total:.2f}GB "
+                f"({gpu_utilization*100:.1f}%), "
+                f"System: {system_used:.2f}GB/{system_total:.2f}GB "
+                f"({system_utilization*100:.1f}%)"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to log memory stats: {e}")
+            # Fallback logging
+            logger.info(f"{prefix}Memory Stats - Unable to retrieve detailed memory information")
 
 
 class DynamicBatchSizeController:
@@ -311,13 +326,25 @@ class DynamicBatchSizeController:
         
         logger.info("Performing aggressive memory cleanup...")
         
-        # Clear PyTorch cache
+        # Clear PyTorch cache multiple times for better cleanup
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            for _ in range(3):  # Multiple passes for thorough cleanup
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
         
-        # Force garbage collection
-        gc.collect()
+        # Force garbage collection multiple times
+        for _ in range(3):
+            gc.collect()
+        
+        # Additional cleanup for specific PyTorch components
+        if torch.cuda.is_available():
+            try:
+                # Reset peak memory stats
+                torch.cuda.reset_peak_memory_stats()
+                # Clear cublas workspace
+                torch.cuda.empty_cache()
+            except Exception as e:
+                logger.warning(f"Error in advanced cleanup: {e}")
         
         # Log memory after cleanup
         self.monitor.log_memory_stats("Post-cleanup ")
