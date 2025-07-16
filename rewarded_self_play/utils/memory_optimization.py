@@ -37,6 +37,14 @@ class MemoryOptimizationConfig:
     enable_gradient_accumulation: bool = True
     max_gradient_accumulation_steps: int = 8
     
+    # Sequence length optimization settings
+    enable_sequence_length_reduction: bool = True
+    max_prompt_length: int = 4096  # Reduced from 6144
+    max_response_length: int = 4096  # Reduced from 8096
+    emergency_prompt_length: int = 2048
+    emergency_response_length: int = 2048
+    sequence_reduction_factor: float = 0.75
+    
     # Memory cleanup settings
     cleanup_frequency: int = 50
     enable_aggressive_cleanup: bool = True

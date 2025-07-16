@@ -636,16 +636,25 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
         
         # Initialize dynamic batch size controller for memory optimization
         memory_config = MemoryOptimizationConfig(
-            initial_batch_size=getattr(self.config.data, 'train_batch_size', 64),
-            min_batch_size=4,  # More aggressive minimum
+            initial_batch_size=min(getattr(self.config.data, 'train_batch_size', 64), 8),  # Start very small
+            min_batch_size=1,  # Allow single sample processing
             max_batch_size=getattr(self.config.data, 'train_batch_size', 64),
-            memory_warning_threshold=0.80,  # More conservative threshold
-            memory_critical_threshold=0.90,  # More conservative threshold
+            memory_warning_threshold=0.70,  # Much more conservative threshold
+            memory_critical_threshold=0.80,  # Much more conservative threshold
             enable_memory_monitoring=True,
-            max_oom_retries=5,  # More retries
-            oom_cooldown_steps=5,  # Shorter cooldown
-            batch_size_reduction_factor=0.5,  # More aggressive reduction
-            enable_aggressive_cleanup=True
+            max_oom_retries=10,  # More retries
+            oom_cooldown_steps=3,  # Shorter cooldown
+            batch_size_reduction_factor=0.25,  # Much more aggressive reduction (75% reduction)
+            enable_aggressive_cleanup=True,
+            emergency_batch_size=1,  # Emergency single sample mode
+            enable_emergency_mode=True,
+            # Sequence length optimization for your very long sequences
+            enable_sequence_length_reduction=True,
+            max_prompt_length=min(getattr(self.config.data, 'max_prompt_length', 6144), 3072),  # Reduce by half
+            max_response_length=min(getattr(self.config.data, 'max_response_length', 8096), 4096),  # Reduce by half
+            emergency_prompt_length=1024,
+            emergency_response_length=1024,
+            sequence_reduction_factor=0.5
         )
         self.batch_controller = DynamicBatchSizeController(memory_config)
         self.memory_processor = create_memory_optimized_batch_processor()[1]
@@ -826,7 +835,26 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
             Aggregated actor output or None if failed
         """
         try:
-            batch_size = len(batch)
+            # Get batch size safely
+            if hasattr(batch, 'batch_size'):
+                batch_size = batch.batch_size
+            elif hasattr(batch, '__len__'):
+                batch_size = len(batch)
+            elif hasattr(batch, 'batch') and isinstance(batch.batch, dict):
+                # Get batch size from first tensor in batch
+                first_key = next(iter(batch.batch.keys()))
+                first_value = batch.batch[first_key]
+                if isinstance(first_value, torch.Tensor):
+                    batch_size = first_value.size(0)
+                elif isinstance(first_value, list):
+                    batch_size = len(first_value)
+                else:
+                    PrettyPrinter.status("Memory", "Cannot determine batch size for chunking", "error")
+                    return None
+            else:
+                PrettyPrinter.status("Memory", "Cannot determine batch size for chunking", "error")
+                return None
+            
             if batch_size <= chunk_size:
                 # Batch is already small enough, the OOM might be due to other factors
                 return None
@@ -2285,13 +2313,33 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
                         # TR-RPG Integration - Display critique policy outputs and TR-RPG metrics
                         PrettyPrinter.section_header("TR-RPG POLICY ANALYSIS")
                         
+                        # Define problem types for this training step
+                        all_types = []
+                        if 'code_i' in self.config.crsp.problem_types:
+                            if not self.pretrain_pred:
+                                all_types.append('gen_code_i')
+                            all_types.append('pred_code_i')
+                        if 'code_o' in self.config.crsp.problem_types:
+                            if not self.pretrain_pred:
+                                all_types.append('gen_code_o')
+                            all_types.append('pred_code_o')
+                        if 'code_e' in self.config.crsp.problem_types:
+                            if not self.pretrain_pred:
+                                all_types.append('gen_code_e')
+                            all_types.append('pred_code_e')
+                        if 'code_f' in self.config.crsp.problem_types:
+                            if not self.pretrain_pred:
+                                all_types.append('gen_code_f')
+                            all_types.append('pred_code_f')
+                        
                         # Extract policy-specific rewards from batch
                         policy_rewards = {}
-                        for i, problem_type in enumerate(all_types):
-                            if 'gen' in problem_type:
-                                policy_rewards['propose'] = batch.batch['token_level_rewards'][i::len(all_types)]
-                            elif 'pred' in problem_type:
-                                policy_rewards['solve'] = batch.batch['token_level_rewards'][i::len(all_types)]
+                        if all_types and hasattr(batch, 'batch') and 'token_level_rewards' in batch.batch:
+                            for i, problem_type in enumerate(all_types):
+                                if 'gen' in problem_type:
+                                    policy_rewards['propose'] = batch.batch['token_level_rewards'][i::len(all_types)]
+                                elif 'pred' in problem_type:
+                                    policy_rewards['solve'] = batch.batch['token_level_rewards'][i::len(all_types)]
                         
                         # Compute actual critique policy rewards based on CRSP framework
                         if 'solve' in policy_rewards:
