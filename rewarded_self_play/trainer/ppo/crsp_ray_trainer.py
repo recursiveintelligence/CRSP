@@ -39,6 +39,11 @@ from rewarded_self_play.utils.code_utils.python_executor import PythonExecutor
 from rewarded_self_play.utils.code_utils.sandboxfusion_executor import SandboxfusionExecutor
 from rewarded_self_play.utils.auxiliary import reflection_keywords
 from rewarded_self_play.utils.logging_utils.stdout import PrettyPrinter
+from rewarded_self_play.utils.memory_optimization import (
+    DynamicBatchSizeController, 
+    MemoryOptimizationConfig,
+    create_memory_optimized_batch_processor
+)
 
 
 seed_program = """def f(a):
@@ -628,6 +633,204 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
             gradient_accumulation_steps=gradient_accumulation_steps,
             max_batch_size=max_batch_size
         )
+        
+        # Initialize dynamic batch size controller for memory optimization
+        memory_config = MemoryOptimizationConfig(
+            initial_batch_size=getattr(self.config.data, 'train_batch_size', 64),
+            min_batch_size=8,
+            max_batch_size=getattr(self.config.data, 'train_batch_size', 64),
+            memory_warning_threshold=0.85,
+            memory_critical_threshold=0.95,
+            enable_memory_monitoring=True,
+            max_oom_retries=3,
+            oom_cooldown_steps=10
+        )
+        self.batch_controller = DynamicBatchSizeController(memory_config)
+        self.memory_processor = create_memory_optimized_batch_processor()[1]
+        
+        PrettyPrinter.status("Memory", f"Initialized dynamic batch size controller with initial size: {memory_config.initial_batch_size}", "info")
+
+    def get_current_batch_config(self) -> Dict[str, int]:
+        """Get current batch size configuration from the dynamic controller."""
+        return self.batch_controller.get_current_config()
+    
+    def log_memory_statistics(self):
+        """Log current memory statistics and controller status."""
+        stats = self.batch_controller.get_statistics()
+        
+        PrettyPrinter.section_header("MEMORY OPTIMIZATION STATUS")
+        PrettyPrinter.status("Memory", f"Current batch size: {stats['current_batch_size']}", "info")
+        PrettyPrinter.status("Memory", f"Gradient accumulation: {stats['gradient_accumulation_steps']}", "info")
+        PrettyPrinter.status("Memory", f"Effective batch size: {stats['effective_batch_size']}", "info")
+        PrettyPrinter.status("Memory", f"OOM events: {stats['oom_events']}", "warning" if stats['oom_events'] > 0 else "info")
+        PrettyPrinter.status("Memory", f"Consecutive successes: {stats['consecutive_successes']}", "success")
+        
+        gpu_info = stats['memory']['gpu']
+        PrettyPrinter.status("Memory", 
+            f"GPU Memory: {gpu_info['allocated']:.2f}GB/{gpu_info['total']:.2f}GB "
+            f"({gpu_info['utilization']*100:.1f}%)", 
+            "warning" if gpu_info['utilization'] > 0.85 else "info"
+        )
+        
+        if stats['avg_throughput'] > 0:
+            PrettyPrinter.status("Memory", f"Avg throughput: {stats['avg_throughput']:.2f} samples/sec", "info")
+
+    def _update_actor_with_oom_handling(self, batch: DataProto, timing_raw: dict):
+        """
+        Update actor with OOM handling and dynamic batch size control.
+        
+        Args:
+            batch: Training batch
+            timing_raw: Timing dictionary for metrics
+            
+        Returns:
+            Actor output or None if failed after retries
+        """
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                # Log memory stats before actor update
+                self.batch_controller.monitor.log_memory_stats("Pre-actor update ")
+                
+                # Check memory pressure before proceeding
+                is_pressure, level = self.batch_controller.monitor.is_memory_pressure()
+                if is_pressure:
+                    PrettyPrinter.status("Memory", f"Memory pressure detected ({level}): {self.batch_controller.monitor.get_gpu_memory_info()['utilization']*100:.1f}%", "warning")
+                
+                # Attempt actor update
+                with marked_timer('update_actor', timing_raw):
+                    actor_output = self.actor_rollout_wg.update_actor(batch)
+                
+                # Record successful step
+                self.batch_controller.record_successful_step(self.global_steps)
+                
+                # Try to increase batch size if conditions are favorable
+                new_batch_size, new_grad_accum = self.batch_controller.try_increase_batch_size(self.global_steps)
+                if new_batch_size != self.batch_controller.current_batch_size:
+                    PrettyPrinter.status("Memory", f"Batch size adjusted to {new_batch_size} (grad accum: {new_grad_accum})", "info")
+                
+                return actor_output
+                
+            except torch.cuda.OutOfMemoryError as e:
+                retry_count += 1
+                PrettyPrinter.status("Memory", f"CUDA OOM Error (attempt {retry_count}/{max_retries}): {str(e)[:100]}...", "error")
+                
+                # Handle OOM with batch size reduction
+                new_batch_size, new_grad_accum = self.batch_controller.handle_oom_error(self.global_steps, e)
+                
+                # Log memory stats after OOM
+                self.batch_controller.monitor.log_memory_stats("Post-OOM ")
+                
+                if retry_count < max_retries:
+                    # Try to split the batch and process in smaller chunks
+                    try:
+                        split_result = self._process_batch_in_chunks(batch, timing_raw, new_batch_size)
+                        if split_result is not None:
+                            PrettyPrinter.status("Memory", f"Successfully processed batch in chunks with size {new_batch_size}", "success")
+                            return split_result
+                    except Exception as chunk_error:
+                        PrettyPrinter.status("Memory", f"Chunked processing also failed: {str(chunk_error)[:100]}...", "error")
+                        continue
+                else:
+                    PrettyPrinter.status("Memory", f"Failed to process batch after {max_retries} attempts", "error")
+                    
+            except Exception as e:
+                PrettyPrinter.status("Memory", f"Unexpected error during actor update: {str(e)[:100]}...", "error")
+                raise
+        
+        return None
+
+    def _process_batch_in_chunks(self, batch: DataProto, timing_raw: dict, chunk_size: int):
+        """
+        Process batch in smaller chunks when OOM occurs.
+        
+        Args:
+            batch: Original batch
+            timing_raw: Timing dictionary
+            chunk_size: Size of each chunk
+            
+        Returns:
+            Aggregated actor output or None if failed
+        """
+        try:
+            batch_size = len(batch)
+            if batch_size <= chunk_size:
+                # Batch is already small enough, the OOM might be due to other factors
+                return None
+            
+            PrettyPrinter.status("Memory", f"Processing batch of size {batch_size} in chunks of {chunk_size}", "info")
+            
+            # Split batch into chunks
+            chunks = []
+            for i in range(0, batch_size, chunk_size):
+                end_idx = min(i + chunk_size, batch_size)
+                chunk_indices = list(range(i, end_idx))
+                
+                # Create chunk by selecting specific indices
+                chunk_data = {}
+                for key, value in batch.batch.items():
+                    if isinstance(value, torch.Tensor):
+                        chunk_data[key] = value[chunk_indices]
+                    elif isinstance(value, list):
+                        chunk_data[key] = [value[idx] for idx in chunk_indices]
+                    else:
+                        chunk_data[key] = value
+                
+                chunk_proto = DataProto(batch=chunk_data, meta_info=batch.meta_info)
+                chunks.append(chunk_proto)
+            
+            # Process each chunk
+            chunk_outputs = []
+            for i, chunk in enumerate(chunks):
+                try:
+                    PrettyPrinter.status("Memory", f"Processing chunk {i+1}/{len(chunks)} (size: {len(chunk)})", "info")
+                    
+                    with marked_timer(f'update_actor_chunk_{i}', timing_raw):
+                        chunk_output = self.actor_rollout_wg.update_actor(chunk)
+                    
+                    chunk_outputs.append(chunk_output)
+                    
+                    # Clear cache after each chunk
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+                except torch.cuda.OutOfMemoryError as chunk_oom:
+                    PrettyPrinter.status("Memory", f"OOM in chunk {i+1}, chunk size too large", "error")
+                    return None
+            
+            # Aggregate chunk outputs
+            if chunk_outputs:
+                # Combine metrics from all chunks
+                aggregated_metrics = {}
+                for chunk_output in chunk_outputs:
+                    if hasattr(chunk_output, 'meta_info') and 'metrics' in chunk_output.meta_info:
+                        for key, value in chunk_output.meta_info['metrics'].items():
+                            if key not in aggregated_metrics:
+                                aggregated_metrics[key] = []
+                            aggregated_metrics[key].append(value)
+                
+                # Average the metrics
+                final_metrics = {}
+                for key, values in aggregated_metrics.items():
+                    if isinstance(values[0], (int, float)):
+                        final_metrics[key] = sum(values) / len(values)
+                    else:
+                        final_metrics[key] = values[0]  # Take first value for non-numeric
+                
+                # Create aggregated output (simplified)
+                class AggregatedOutput:
+                    def __init__(self, metrics):
+                        self.meta_info = {'metrics': metrics}
+                
+                return AggregatedOutput(final_metrics)
+            
+            return None
+            
+        except Exception as e:
+            PrettyPrinter.status("Memory", f"Error in chunked processing: {str(e)[:100]}...", "error")
+            return None
 
     def _perform_memory_optimized_tr_rpg_step(self, batch: DataProto, actor_output) -> Dict[str, torch.Tensor]:
         """
@@ -1991,10 +2194,13 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        with marked_timer('update_actor', timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                        metrics.update(actor_output_metrics)
+                        # Use dynamic batch size controller for actor update
+                        actor_output = self._update_actor_with_oom_handling(batch, timing_raw)
+                        if actor_output is not None:
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                            metrics.update(actor_output_metrics)
+                        else:
+                            PrettyPrinter.status("Memory", "Skipping actor update due to persistent OOM errors", "warning")
                         
                         # Memory-optimized TR-RPG training step
                         with marked_timer('tr_rpg_training', timing_raw):
@@ -2225,6 +2431,10 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
                     self.pretrain_pred = False
 
                 self.global_steps += 1
+
+                # Log memory statistics periodically
+                if self.global_steps % 10 == 0:  # Log every 10 steps
+                    self.log_memory_statistics()
 
                 gc.collect()
 
