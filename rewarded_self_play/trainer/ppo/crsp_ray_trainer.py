@@ -2377,24 +2377,24 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
                             
                             # Display detailed CRSP metrics
                             PrettyPrinter.section_header("CRSP DETAILED METRICS")
-                            PrettyPrinter.info("CRSP", f"LENGTH REWARDS:")
-                            PrettyPrinter.info("CRSP", f"  ├─ Mean: {np.mean(length_rewards):.4f}")
-                            PrettyPrinter.info("CRSP", f"  ├─ Std: {np.std(length_rewards):.4f}")
-                            PrettyPrinter.info("CRSP", f"  ├─ Min: {np.min(length_rewards):.4f}")
-                            PrettyPrinter.info("CRSP", f"  └─ Max: {np.max(length_rewards):.4f}")
+                            PrettyPrinter.status("CRSP", f"LENGTH REWARDS:", "info")
+                            PrettyPrinter.status("CRSP", f"  ├─ Mean: {np.mean(length_rewards):.4f}", "info")
+                            PrettyPrinter.status("CRSP", f"  ├─ Std: {np.std(length_rewards):.4f}", "info")
+                            PrettyPrinter.status("CRSP", f"  ├─ Min: {np.min(length_rewards):.4f}", "info")
+                            PrettyPrinter.status("CRSP", f"  └─ Max: {np.max(length_rewards):.4f}", "info")
                             
-                            PrettyPrinter.info("CRSP", f"CREATIVITY REWARDS:")
-                            PrettyPrinter.info("CRSP", f"  ├─ Mean: {np.mean(creativity_rewards):.4f}")
-                            PrettyPrinter.info("CRSP", f"  ├─ Std: {np.std(creativity_rewards):.4f}")
-                            PrettyPrinter.info("CRSP", f"  ├─ Min: {np.min(creativity_rewards):.4f}")
-                            PrettyPrinter.info("CRSP", f"  └─ Max: {np.max(creativity_rewards):.4f}")
+                            PrettyPrinter.status("CRSP", f"CREATIVITY REWARDS:", "info")
+                            PrettyPrinter.status("CRSP", f"  ├─ Mean: {np.mean(creativity_rewards):.4f}", "info")
+                            PrettyPrinter.status("CRSP", f"  ├─ Std: {np.std(creativity_rewards):.4f}", "info")
+                            PrettyPrinter.status("CRSP", f"  ├─ Min: {np.min(creativity_rewards):.4f}", "info")
+                            PrettyPrinter.status("CRSP", f"  └─ Max: {np.max(creativity_rewards):.4f}", "info")
                             
-                            PrettyPrinter.info("CRSP", f"ALPHA DECAY SCHEDULE:")
-                            PrettyPrinter.info("CRSP", f"  ├─ Current Step: {self.global_steps}")
-                            PrettyPrinter.info("CRSP", f"  ├─ Total Steps: {self.total_training_steps}")
-                            PrettyPrinter.info("CRSP", f"  ├─ Progress: {self.global_steps/self.total_training_steps:.2%}")
-                            PrettyPrinter.info("CRSP", f"  ├─ Alpha S (Solver): {alpha_s:.4f}")
-                            PrettyPrinter.info("CRSP", f"  └─ Alpha C (Critique): {alpha_c:.4f}")
+                            PrettyPrinter.status("CRSP", f"ALPHA DECAY SCHEDULE:", "info")
+                            PrettyPrinter.status("CRSP", f"  ├─ Current Step: {self.global_steps}", "info")
+                            PrettyPrinter.status("CRSP", f"  ├─ Total Steps: {self.total_training_steps}", "info")
+                            PrettyPrinter.status("CRSP", f"  ├─ Progress: {self.global_steps/self.total_training_steps:.2%}", "info")
+                            PrettyPrinter.status("CRSP", f"  ├─ Alpha S (Solver): {alpha_s:.4f}", "info")
+                            PrettyPrinter.status("CRSP", f"  └─ Alpha C (Critique): {alpha_c:.4f}", "info")
                             
                             # Add CRSP metrics to overall metrics
                             metrics.update({
@@ -2410,18 +2410,18 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
                         # Display detailed policy outputs
                         for policy_name, rewards in policy_rewards.items():
                             if len(rewards) > 0:
-                                PrettyPrinter.info("TR-RPG", f"{policy_name.upper()} POLICY:")
-                                PrettyPrinter.info("TR-RPG", f"  ├─ Reward Mean: {torch.mean(rewards).item():.4f}")
-                                PrettyPrinter.info("TR-RPG", f"  ├─ Reward Std: {torch.std(rewards).item():.4f}")
-                                PrettyPrinter.info("TR-RPG", f"  ├─ Reward Min: {torch.min(rewards).item():.4f}")
-                                PrettyPrinter.info("TR-RPG", f"  ├─ Reward Max: {torch.max(rewards).item():.4f}")
-                                PrettyPrinter.info("TR-RPG", f"  └─ Sample Count: {len(rewards)}")
+                                PrettyPrinter.status("TR-RPG", f"{policy_name.upper()} POLICY:", "info")
+                                PrettyPrinter.status("TR-RPG", f"  ├─ Reward Mean: {torch.mean(rewards).item():.4f}", "info")
+                                PrettyPrinter.status("TR-RPG", f"  ├─ Reward Std: {torch.std(rewards).item():.4f}", "info")
+                                PrettyPrinter.status("TR-RPG", f"  ├─ Reward Min: {torch.min(rewards).item():.4f}", "info")
+                                PrettyPrinter.status("TR-RPG", f"  ├─ Reward Max: {torch.max(rewards).item():.4f}", "info")
+                                PrettyPrinter.status("TR-RPG", f"  └─ Sample Count: {len(rewards)}", "info")
                         
                         # Get TR-RPG training metrics
                         tr_rpg_metrics = self.tr_rpg_trainer.get_training_metrics()
-                        PrettyPrinter.info("TR-RPG", "TRAINING METRICS:")
+                        PrettyPrinter.status("TR-RPG", "TRAINING METRICS:", "info")
                         for metric_name, metric_value in tr_rpg_metrics.items():
-                            PrettyPrinter.info("TR-RPG", f"  ├─ {metric_name}: {metric_value:.6f}")
+                            PrettyPrinter.status("TR-RPG", f"  ├─ {metric_name}: {metric_value:.6f}", "info")
                         
                         # Add TR-RPG metrics to overall metrics
                         metrics.update({f"tr_rpg/{k}": v for k, v in tr_rpg_metrics.items()})
