@@ -4,9 +4,9 @@ from numpy import random
 import pandas as pd
 from transformers import AutoTokenizer
 
-from absolute_zero_reasoner.data_construction.prompts import get_code_problem_generator_prompt, get_code_problem_predictor_prompt
-from absolute_zero_reasoner.data_construction.process_data import boxed_instruction, instruction_following
-from absolute_zero_reasoner.utils.code_utils.parsers import replace_main_function_name
+from rewarded_self_play.data_construction.prompts import get_code_problem_generator_prompt, get_code_problem_predictor_prompt
+from rewarded_self_play.data_construction.process_data import boxed_instruction, instruction_following
+from rewarded_self_play.utils.code_utils.parsers import replace_main_function_name
 
 
 def get_gen_code_io_data(

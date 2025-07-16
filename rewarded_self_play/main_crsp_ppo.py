@@ -1,5 +1,3 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -24,13 +22,84 @@ from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils import hf_tokenizer
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
-from absolute_zero_reasoner.trainer.ppo.azr_ray_trainer import CodeIORayPPOTrainer
-from absolute_zero_reasoner.rewards.reward_managers import CodeIORewardManager
+from rewarded_self_play.trainer.ppo.crsp_ray_trainer import CRSPRayPPOTrainer
+from rewarded_self_play.rewards.reward_managers import CodeIORewardManager
 
 
-@hydra.main(config_path='configs', config_name='azr_ppo_trainer', version_base=None)
+@hydra.main(config_path='configs', config_name='crsp_ppo_trainer', version_base=None)
 def main(config):
+    # Support command-line override for CRSP parameters
+    # Trajectory seeding examples:
+    #   python main_crsp_ppo.py trajectory_seeding.enabled=true
+    #   python main_crsp_ppo.py trajectory_seeding.enabled=true trajectory_seeding.epochs=2
+    #   python main_crsp_ppo.py trajectory_seeding.limo_dataset_path="custom/path"
+    # 
+    # CRSP training examples:
+    #   python main_crsp_ppo.py crsp.executor=sandboxfusion
+    #   python main_crsp_ppo.py crsp.problem_types=[code_i,code_o]
+    #   python main_crsp_ppo.py trainer.experiment_name=my_crsp_experiment
+    
+    # Validate trajectory seeding configuration
+    validate_trajectory_seeding_config(config)
+    
+    # Print configuration summary
+    print_config_summary(config)
+    
     run_ppo(config)
+
+
+def print_config_summary(config):
+    """Print a summary of key CRSP configuration parameters."""
+    print("=" * 60)
+    print("CRSP CONFIGURATION SUMMARY")
+    print("=" * 60)
+    print(f"Experiment name: {config.trainer.experiment_name}")
+    print(f"Model path: {config.actor_rollout_ref.model.path}")
+    print(f"Problem types: {config.crsp.problem_types}")
+    print(f"Executor: {config.crsp.executor}")
+    print(f"Total epochs: {config.trainer.total_epochs}")
+    
+    if config.trajectory_seeding.enabled:
+        print(f"Trajectory seeding: ENABLED")
+        print(f"  - Dataset: {config.trajectory_seeding.limo_dataset_path}")
+        print(f"  - Epochs: {config.trajectory_seeding.epochs}")
+        print(f"  - Batch size: {config.trajectory_seeding.batch_size}")
+        print(f"  - Learning rate: {config.trajectory_seeding.learning_rate}")
+    else:
+        print(f"Trajectory seeding: DISABLED")
+    
+    print("=" * 60)
+
+
+def validate_trajectory_seeding_config(config):
+    """Validate trajectory seeding configuration parameters."""
+    if config.trajectory_seeding.enabled:
+        # Validate required parameters
+        assert config.trajectory_seeding.limo_dataset_path, "limo_dataset_path must be specified when trajectory seeding is enabled"
+        assert config.trajectory_seeding.batch_size > 0, "batch_size must be positive"
+        assert config.trajectory_seeding.learning_rate > 0, "learning_rate must be positive"
+        assert config.trajectory_seeding.epochs > 0, "epochs must be positive"
+        assert 0 <= config.trajectory_seeding.alpha <= 1, "alpha must be between 0 and 1"
+        
+        # Validate validation configuration if enabled
+        if config.trajectory_seeding.validation.enabled:
+            assert config.trajectory_seeding.validation.eval_steps > 0, "eval_steps must be positive"
+            assert config.trajectory_seeding.validation.save_total_limit > 0, "save_total_limit must be positive"
+        
+        print(f"Trajectory seeding enabled with dataset: {config.trajectory_seeding.limo_dataset_path}")
+        print(f"Seeding configuration: epochs={config.trajectory_seeding.epochs}, "
+              f"batch_size={config.trajectory_seeding.batch_size}, "
+              f"learning_rate={config.trajectory_seeding.learning_rate}")
+        
+        # Set default values for optional parameters
+        if not hasattr(config.trajectory_seeding, 'cache_dir') or not config.trajectory_seeding.cache_dir:
+            config.trajectory_seeding.cache_dir = "~/.cache/crsp/limo"
+        if not hasattr(config.trajectory_seeding, 'save_steps'):
+            config.trajectory_seeding.save_steps = 500
+        if not hasattr(config.trajectory_seeding, 'logging_steps'):
+            config.trajectory_seeding.logging_steps = 100
+    else:
+        print("Trajectory seeding disabled - proceeding directly to self-play training")
 
 
 # Define a function to run the PPO-like training process
@@ -76,14 +145,14 @@ class TaskRunner:
             print("Debugger attached!")
 
         # generator one batch, solver one batch
-        config.actor_rollout_ref.actor.ppo_mini_batch_size = config.data.train_batch_size * len(config.azr.problem_types) * (2 if config.azr.train_propose else 1)
+        config.actor_rollout_ref.actor.ppo_mini_batch_size = config.data.train_batch_size * len(config.crsp.problem_types) * (2 if config.crsp.train_propose else 1)
         pprint(f"auto setting ppo_mini_batch_size: {config.actor_rollout_ref.actor.ppo_mini_batch_size}")
-        config.azr.data_selection_strategy.data_len = config.data.train_batch_size * config.azr.data_selection_strategy.update_iteration
-        pprint(f"auto setting data_len: {config.azr.data_selection_strategy.data_len}")
+        config.crsp.data_selection_strategy.data_len = config.data.train_batch_size * config.crsp.data_selection_strategy.update_iteration
+        pprint(f"auto setting data_len: {config.crsp.data_selection_strategy.data_len}")
 
         config.trainer.default_local_dir = (Path(config.trainer.default_local_dir) / config.data.train_files.split('/')[-1].split('.')[0] / config.actor_rollout_ref.model.path.split('/')[-1] / config.reward_fn.extraction_type).as_posix()
 
-        assert not (not config.azr.reward.generation_reward_config.reject_multiple_functions and config.azr.data_selection_strategy.composite_function_n_min > 0), "If reject_multiple_functions is False, composite_function_n_min must be 0"
+        assert not (not config.crsp.reward.generation_reward_config.reject_multiple_functions and config.crsp.data_selection_strategy.composite_function_n_min > 0), "If reject_multiple_functions is False, composite_function_n_min must be 0"
 
         # download the checkpoint from hdfs
         local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
@@ -178,11 +247,11 @@ class TaskRunner:
             splitter=config.reward_fn.splitter,
             output_path=config.trainer.default_local_dir,
             max_prompt_length=config.data.max_prompt_length,
-            generation_reward_config=config.azr.reward.generation_reward_config,
-            valid_program_filter=config.azr.data_selection_strategy.valid_program_filter,
+            generation_reward_config=config.crsp.reward.generation_reward_config,
+            valid_program_filter=config.crsp.data_selection_strategy.valid_program_filter,
             debug=config.trainer.debug,
-            extract_code_block=config.azr.reward.extract_code_block,
-            code_f_reward_type=config.azr.reward.code_f_reward_type,
+            extract_code_block=config.crsp.reward.extract_code_block,
+            code_f_reward_type=config.crsp.reward.code_f_reward_type,
             boxed_retry=config.reward_fn.boxed_retry,
         )
 
@@ -196,28 +265,67 @@ class TaskRunner:
             splitter=config.reward_fn.splitter,
             output_path=config.trainer.default_local_dir,
             max_prompt_length=config.data.max_prompt_length,
-            generation_reward_config=config.azr.reward.generation_reward_config,
-            valid_program_filter=config.azr.data_selection_strategy.valid_program_filter,
+            generation_reward_config=config.crsp.reward.generation_reward_config,
+            valid_program_filter=config.crsp.data_selection_strategy.valid_program_filter,
             debug=config.trainer.debug,
-            extract_code_block=config.azr.reward.extract_code_block,
-            code_f_reward_type=config.azr.reward.code_f_reward_type,
+            extract_code_block=config.crsp.reward.extract_code_block,
+            code_f_reward_type=config.crsp.reward.code_f_reward_type,
             boxed_retry=config.reward_fn.boxed_retry,
         )
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
         wandb_tags = [
-            'codeio', config.azr.pred_data_mix_strategy, 'executor-' + config.azr.executor,
-            config.azr.data_selection_strategy.valid_program_filter, config.azr.gen_data_probabilities_strategy,
+            'codeio', config.crsp.pred_data_mix_strategy, 'executor-' + config.crsp.executor,
+            config.crsp.data_selection_strategy.valid_program_filter, config.crsp.gen_data_probabilities_strategy,
         ]
-        wandb_tags.extend(config.azr.problem_types)
+        wandb_tags.extend(config.crsp.problem_types)
         if config.trainer.wandb_tags is not None:
             config.trainer.wandb_tags = wandb_tags + config.trainer.wandb_tags.split(',')
         else:
             config.trainer.wandb_tags = wandb_tags
 
-        trainer = CodeIORayPPOTrainer(
-            past_epoch_window=config.azr.past_epoch_window,
+        # Phase 1: Optional trajectory seeding phase
+        seeded_model_path = local_path  # Default to original model path
+        if config.trajectory_seeding.enabled:
+            print("=" * 60)
+            print("PHASE 1: TRAJECTORY SEEDING")
+            print("=" * 60)
+            print("Starting trajectory seeding phase...")
+            
+            from rewarded_self_play.trajectory_seeding.seeder import TrajectorySeeder
+            
+            seeder = TrajectorySeeder(
+                model_path=local_path,
+                tokenizer=tokenizer,
+                config=config.trajectory_seeding
+            )
+            
+            # Run trajectory seeding
+            seeded_model_path = seeder.run_seeding()
+            
+            print(f"Trajectory seeding completed successfully!")
+            print(f"Seeded model saved to: {seeded_model_path}")
+            print("=" * 60)
+        else:
+            print("Trajectory seeding disabled - proceeding directly to self-play training")
+        
+        # Phase 2: Self-play training phase
+        print("=" * 60)
+        print("PHASE 2: SELF-PLAY TRAINING")
+        print("=" * 60)
+        
+        # Update model path to use seeded model (or original if seeding disabled)
+        config.actor_rollout_ref.model.path = seeded_model_path
+        
+        # Update critic model path to match actor if not explicitly set differently
+        if not hasattr(config.critic.model, 'path') or config.critic.model.path == local_path:
+            config.critic.model.path = seeded_model_path
+            
+        print(f"Using model for self-play training: {seeded_model_path}")
+        
+        trainer = CRSPRayPPOTrainer(
+            past_epoch_window=config.crsp.past_epoch_window,
             config=config,
             tokenizer=tokenizer,
             processor=processor,

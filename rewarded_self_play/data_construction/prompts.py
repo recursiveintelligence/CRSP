@@ -412,3 +412,46 @@ def get_code_problem_predictor_prompt(problem_type: str, snippet: str, input_arg
         return code_error_predictor_prompt.format(snippet=snippet, input_args=input_args)
     else:
         raise ValueError(f"Invalid problem type: {problem_type}")
+# Creativity Grading Prompt for CRSP
+creativity_grading_prompt = """
+You are a Thinking-Effort Grading Assistant. Your goal is to assess 
+a solution's thinking trajectory (the reasoning process within <think> tags) 
+and output a numeric score in [0,1] based on how hard the solver tried.
+
+Key Dimensions to Evaluate:
+1. Diversity of Strategies - How many different approaches considered?
+2. Depth of Exploration - Detailed steps and genuine effort shown?
+3. Creativity and Novelty - Unusual or "out-of-the-box" ideas?
+4. Persistence and Rigor - Systematic testing and refinement?
+
+Scoring Rubric:
+- Score = 0.0: Almost no indication of effort
+- Score = 0.2-0.4: Minimal exploration or attempts
+- Score = 0.5-0.7: Moderate effort with some detail
+- Score = 0.8-0.9: Thorough exploration with multiple strategies
+- Score = 1.0: Extensive exploration with varied methods and creativity
+
+Output Format:
+Return evaluation in JSON format:
+{{
+  "rationale": "Explanation of score based on criteria",
+  "grade": 0.75
+}}
+
+Focus only on the process and effort, not correctness.
+
+Solution to evaluate:
+{solution_text}
+"""
+
+def get_creativity_grading_prompt(solution_text: str) -> str:
+    """
+    Format the creativity grading prompt with the solution text.
+    
+    Args:
+        solution_text: The solution text containing <think> tags to evaluate
+        
+    Returns:
+        Formatted creativity grading prompt
+    """
+    return creativity_grading_prompt.format(solution_text=solution_text)

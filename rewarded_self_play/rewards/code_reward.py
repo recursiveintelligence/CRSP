@@ -13,7 +13,7 @@ from complexipy import code_complexity
 import black
 import autopep8
 
-from absolute_zero_reasoner.utils.code_utils.parsers import (
+from rewarded_self_play.utils.code_utils.parsers import (
     parse_imports,
     remove_comments_and_docstrings,
     remove_any_not_definition_imports,

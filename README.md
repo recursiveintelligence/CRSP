@@ -32,7 +32,7 @@
 
 <!-- ============================================== -->
 
-> **⚠️WARNING⚠️**: New Qwen3 base models have untrained <think> token embeddings, we used `python absolute_zero_reasoner/utils/remove_think_qwen3_tokenizer.py --model_name <Qwen3ModelName>` to remove these tokens or else the model produces nonsense.
+> **⚠️WARNING⚠️**: New Qwen3 base models have untrained <think> token embeddings, we used `python rewarded_self_play/utils/remove_think_qwen3_tokenizer.py --model_name <Qwen3ModelName>` to remove these tokens or else the model produces nonsense.
 
 > **🚧UNDER TESTING🚧** This new merge to `main` is still under testing. Use the `paper` branch to replicate results from original paper. 
 
@@ -339,15 +339,15 @@ AZR shows consistent improvements across model sizes and types:
 
 ## 🎄 Environment Setup
 ```bash
-conda env create -f azr_env.yml
-conda activate azr
+conda env create -f crsp_env.yml
+conda activate crsp
 pip install -r flashattn_requirements.txt
 ```
 
 ## 💾 Data Processing
 ### Process evaluation data on CruxEval / LiveCodeBench Execution during AZR Self-play
 ```bash
-python -m absolute_zero_reasoner.data_construction.process_code_reasoning_data
+python -m rewarded_self_play.data_construction.process_code_reasoning_data
 ```
 
 <!-- ============================================== -->
@@ -378,21 +378,21 @@ export OUTPUT_SEED_PATH=data/<your_ded_abd_seed_data_name>.jsonl
 export OUTPUT_CODE_F_SEED_PATH=data/<your_ind_seed_data_name>.jsonl
 bash scripts/selfplay/<7b|14b|coder3b|coder7b|coder14b|llama>.sh
 ```
-For using the newly supported sandbox-fusion executor, use docker and set `azr.executor=sandboxfusion`.
+For using the newly supported sandbox-fusion executor, use docker and set `crsp.executor=sandboxfusion`.
 
 ## 🌚 Resuming Runs
 When resuming runs, put the original run wandb id into the script, i.e., `trainer.wandb_run_id=<run_id>`.
 
 ## 🤗 Converting veRL checkpoints to HF format
 ```bash
-python -m absolute_zero_reasoner.utils.convert2hf \
+python -m rewarded_self_play.utils.convert2hf \
   <veRL_ckpt_path>/actor \
   <veRL_ckpt_path>/actor/huggingface/ \
   <hf_ckpt_path>
 ```
 
 ## 📈Design Your Own Intrinsic Rewards!
-In configs, just add your own rewards to `azr.reward.generation_reward_config`, check the ones already implemented such as diversity and complexity rewards. Be Creative!
+In configs, just add your own rewards to `crsp.reward.generation_reward_config`, check the ones already implemented such as diversity and complexity rewards. Be Creative!
 
 <!-- ============================================== -->
 <div align="left">

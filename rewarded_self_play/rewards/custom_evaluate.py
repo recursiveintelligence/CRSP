@@ -19,7 +19,7 @@ from typing import Tuple, List, Dict
 
 from math_verify import parse, verify
 
-from absolute_zero_reasoner.rewards.math_utils import grade_answer_mathd, grade_answer_sympy
+from rewarded_self_play.rewards.math_utils import grade_answer_mathd, grade_answer_sympy
 
 
 def choice_answer_clean(pred: str):

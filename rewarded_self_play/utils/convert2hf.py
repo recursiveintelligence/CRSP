@@ -14,10 +14,10 @@ def main(
         huggingface_model_path: path to the HuggingFace model
         output_path: path to save the converted checkpoint
     Usage:
-        python reason_rl/utils/convert2hf.py \
-            checkpoints/azr/azr/test/test_answer/Qwen2.5-7B/answer_conditional/global_step_160_copy/actor \
-            checkpoints/azr/azr/test/test_answer/Qwen2.5-7B/answer_conditional/global_step_160_copy/actor/huggingface/ \
-            azr_90_composite_160_steps
+        python rewarded_self_play/utils/convert2hf.py \
+            checkpoints/crsp/crsp/test/test_answer/Qwen2.5-7B/answer_conditional/global_step_160_copy/actor \
+            checkpoints/crsp/crsp/test/test_answer/Qwen2.5-7B/answer_conditional/global_step_160_copy/actor/huggingface/ \
+            crsp_90_composite_160_steps
     """
     state_dict = defaultdict(list)
 

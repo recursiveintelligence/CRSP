@@ -1,0 +1,71 @@
+# CRSP Trajectory Seeding Configuration
+# This configuration file is used for the trajectory seeding phase
+
+# Trajectory seeding parameters
+trajectory_seeding:
+  enabled: true
+  limo_dataset_path: "GAIR/LIMO"
+  cache_dir: "~/.cache/crsp/limo"
+  
+  # Training parameters
+  epochs: 1
+  learning_rate: 1e-5
+  batch_size: 32
+  max_length: 2048
+  alpha: 0.1  # Weight for answer prediction in SFT loss
+  
+  # Output and logging
+  output_dir: "./trajectory_seeding_output"
+  save_steps: 500
+  logging_steps: 100
+  
+  # Optimization parameters
+  weight_decay: 0.01
+  warmup_steps: 100
+  gradient_accumulation_steps: 1
+  fp16: true
+  dataloader_num_workers: 4
+  remove_unused_columns: false
+  
+  # Validation configuration
+  validation:
+    enabled: true
+    eval_steps: 250
+    eval_strategy: "steps"
+    metric_for_best_model: "eval_loss"
+    greater_is_better: false
+    load_best_model_at_end: true
+    save_total_limit: 3
+    validation_samples: 100
+
+# Model configuration
+model:
+  path: "~/models/deepseek-llm-7b-chat"
+  trust_remote_code: true
+  torch_dtype: "bfloat16"
+  device_map: "auto"
+  
+# Tokenizer configuration
+tokenizer:
+  path: "~/models/deepseek-llm-7b-chat"
+  trust_remote_code: true
+  padding_side: "left"
+  truncation_side: "left"
+  
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+# Hardware configuration
+hardware:
+  use_cuda: true
+  mixed_precision: "fp16"
+  gradient_checkpointing: true
+  
+# Data processing configuration
+data_processing:
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2

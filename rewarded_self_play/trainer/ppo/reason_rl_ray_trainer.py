@@ -19,7 +19,7 @@ from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.trainer.ppo.ray_trainer import Role, WorkerType, ResourcePoolManager
 from verl.utils.tracking import ValidationGenerationsLogger
 
-from absolute_zero_reasoner.utils.dataset.rl_dataset import RLHFDataset
+from rewarded_self_play.utils.dataset.rl_dataset import RLHFDataset
 
 
 
@@ -412,8 +412,8 @@ class ReasonRLRayPPOTrainer(RayPPOTrainer):
 
         The only difference is logging more metrics.
         """
-        from absolute_zero_reasoner.utils.tracking import ReasonRLTracking
-        from absolute_zero_reasoner.utils.logging_utils.stdout import PrettyPrinter as pp
+        from rewarded_self_play.utils.tracking import ReasonRLTracking
+        from rewarded_self_play.utils.logging_utils.stdout import PrettyPrinter as pp
         from omegaconf import OmegaConf
 
         # Display training setup header

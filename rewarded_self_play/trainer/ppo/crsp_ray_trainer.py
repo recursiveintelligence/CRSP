@@ -26,18 +26,19 @@ from verl.trainer.ppo.ray_trainer import (
     compute_timing_metrics,
     agg_loss,
 )
+from rewarded_self_play.trainer.ppo.tr_rpg import TaskRelativeRPG, TRRPGConfig, TRRPGTrainer
 from verl.trainer.ppo.metric_utils import _compute_response_info
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProto
 
-from absolute_zero_reasoner.utils.tracking import ReasonRLTracking
-from absolute_zero_reasoner.data_construction.constructor import get_gen_code_io_data, get_pred_code_io_data
-from absolute_zero_reasoner.trainer.ppo.reason_rl_ray_trainer import ReasonRLRayPPOTrainer
-from absolute_zero_reasoner.utils.dataset.rl_dataset import RLHFDataset
-from absolute_zero_reasoner.rewards.code_reward import parse_code_input_output, parse_inputs_message
-from absolute_zero_reasoner.utils.code_utils.python_executor import PythonExecutor
-from absolute_zero_reasoner.utils.code_utils.sandboxfusion_executor import SandboxfusionExecutor
-from absolute_zero_reasoner.utils.auxiliary import reflection_keywords
-from absolute_zero_reasoner.utils.logging_utils.stdout import PrettyPrinter
+from rewarded_self_play.utils.tracking import ReasonRLTracking
+from rewarded_self_play.data_construction.constructor import get_gen_code_io_data, get_pred_code_io_data
+from rewarded_self_play.trainer.ppo.reason_rl_ray_trainer import ReasonRLRayPPOTrainer
+from rewarded_self_play.utils.dataset.rl_dataset import RLHFDataset
+from rewarded_self_play.rewards.code_reward import parse_code_input_output, parse_inputs_message
+from rewarded_self_play.utils.code_utils.python_executor import PythonExecutor
+from rewarded_self_play.utils.code_utils.sandboxfusion_executor import SandboxfusionExecutor
+from rewarded_self_play.utils.auxiliary import reflection_keywords
+from rewarded_self_play.utils.logging_utils.stdout import PrettyPrinter
 
 
 seed_program = """def f(a):
@@ -582,32 +583,43 @@ class DatasetManager:
             self.type_counters[counter_type][element_type][element] += 1
 
 
-class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
+class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
     _supported_tasks = {'code_i', 'code_o', 'code_e', 'code_f'}
     def __init__(self, past_epoch_window: int = 10, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.config.actor_rollout_ref.rollout.n == 1, "CodeIO only supports n=1 for now"
-        assert all(problem_type in self._supported_tasks for problem_type in self.config.azr.problem_types), \
-            f"Invalid problem type: {self.config.azr.problem_types}"
+        assert all(problem_type in self._supported_tasks for problem_type in self.config.crsp.problem_types), \
+            f"Invalid problem type: {self.config.crsp.problem_types}"
         self._past_epoch_window = past_epoch_window
-        if self.config.azr.executor == 'qwq':
+        if self.config.crsp.executor == 'qwq':
             self._executor = PythonExecutor(
-                timeout_length=self.config.azr.execute_max_timeout, 
-                ast_check=self.config.azr.ast_check,
-                max_workers=self.config.azr.get('executor_max_workers', 1)
+                timeout_length=self.config.crsp.execute_max_timeout, 
+                ast_check=self.config.crsp.ast_check,
+                max_workers=self.config.crsp.get('executor_max_workers', 1)
             )
-        elif self.config.azr.executor == 'sandboxfusion':
+        elif self.config.crsp.executor == 'sandboxfusion':
             self._executor = SandboxfusionExecutor(
-                timeout_length=self.config.azr.execute_max_timeout, 
-                ast_check=self.config.azr.ast_check,
-                max_workers=self.config.azr.get('executor_max_workers', 1),
-                use_china_mirror=self.config.azr.get('use_china_mirror', True)
+                timeout_length=self.config.crsp.execute_max_timeout, 
+                ast_check=self.config.crsp.ast_check,
+                max_workers=self.config.crsp.get('executor_max_workers', 1),
+                use_china_mirror=self.config.crsp.get('use_china_mirror', True)
             )
         else:
-            raise ValueError(f'Invalid executor: {self.config.azr.executor}')
+            raise ValueError(f'Invalid executor: {self.config.crsp.executor}')
         self.dataset_manager = DatasetManager.remote()
         self._last_cleanup_step = 0
-        self._cleanup_frequency = self.config.azr.get('executor_cleanup_frequency', 5)
+        self._cleanup_frequency = self.config.crsp.get('executor_cleanup_frequency', 5)
+        
+        # Initialize TR-RPG trainer
+        tr_rpg_config = TRRPGConfig(
+            policies=['propose', 'solve', 'critique'],
+            beta_coefficients={
+                'propose': 0.01,   # Encourage task diversity
+                'solve': 0.05,     # Balance exploration/correctness  
+                'critique': 0.1    # Stable evaluation
+            }
+        )
+        self.tr_rpg_trainer = TRRPGTrainer(tr_rpg_config)
 
     def cleanup(self):
         """Clean up the executor and other resources"""
@@ -645,47 +657,47 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
 
         # Handle weights strategy
         if problem_type == 'code_f' and not seeding:
-            if self.config.azr.gen_data_probabilities_strategy == 'step':
+            if self.config.crsp.gen_data_probabilities_strategy == 'step':
                 entries_with_steps = ray.get(self.dataset_manager.get_snippets_with_steps.remote())
                 weights = [w + 1 for _, w in entries_with_steps] if entries_with_steps else [1.0]*len(io_data)
             else:
                 weights = [1.0] * len(io_data)
         elif dataset_key == 'seed':
             weights = None
-        elif self.config.azr.gen_data_probabilities_strategy == 'uniform':
+        elif self.config.crsp.gen_data_probabilities_strategy == 'uniform':
             weights = [1.0] * len(io_data)
-        elif self.config.azr.gen_data_probabilities_strategy == 'step':
+        elif self.config.crsp.gen_data_probabilities_strategy == 'step':
             weights = [w + 1 for w in ray.get(self.dataset_manager.get_steps_dataset.remote(dataset_key))]
         else:
-            raise ValueError(f"Unknown strategy: {self.config.azr.gen_data_probabilities_strategy}")
+            raise ValueError(f"Unknown strategy: {self.config.crsp.gen_data_probabilities_strategy}")
 
         # Common parameters for get_gen_code_io_data
         gen_params = {
             'io_data': io_data,
             'target_data_len': data_len,
             'problem_type': problem_type,
-            'content_max_length': self.config.azr.data_selection_strategy.content_max_length,
-            'io_n': 1 if problem_type == 'code_f' else self.config.azr.data_selection_strategy.io_n,
+            'content_max_length': self.config.crsp.data_selection_strategy.content_max_length,
+            'io_n': 1 if problem_type == 'code_f' else self.config.crsp.data_selection_strategy.io_n,
             'instruction_type': self.config.reward_fn.extraction_type,
             'output_path': parquet_path,
             'split': 'train',
             'tokenizer': self.tokenizer,
-            'banned_keywords': self.config.azr.data_selection_strategy.banned_words,
-            'banned_assertion_keywords': self.config.azr.data_selection_strategy.banned_keywords_for_errors_and_exceptions,
+            'banned_keywords': self.config.crsp.data_selection_strategy.banned_words,
+            'banned_assertion_keywords': self.config.crsp.data_selection_strategy.banned_keywords_for_errors_and_exceptions,
             'weights': weights,
-            'enable_composite_function': self.config.azr.data_selection_strategy.composite_start_step > 0 and self.global_steps >= self.config.azr.data_selection_strategy.composite_start_step,
-            'composite_function_n_min': self.config.azr.data_selection_strategy.composite_function_n_min,
-            'composite_function_n_max': self.config.azr.data_selection_strategy.composite_function_n_max,
-            'composite_chance': self.config.azr.data_selection_strategy.composite_chance,
-            'remove_after_return': self.config.azr.reward.generation_reward_config.remove_after_return,
-            'remove_input_from_snippet': self.config.azr.reward.generation_reward_config.remove_input_from_snippet,
-            'include_references': self.config.azr.reward.generation_reward_config.include_references,
+            'enable_composite_function': self.config.crsp.data_selection_strategy.composite_start_step > 0 and self.global_steps >= self.config.crsp.data_selection_strategy.composite_start_step,
+            'composite_function_n_min': self.config.crsp.data_selection_strategy.composite_function_n_min,
+            'composite_function_n_max': self.config.crsp.data_selection_strategy.composite_function_n_max,
+            'composite_chance': self.config.crsp.data_selection_strategy.composite_chance,
+            'remove_after_return': self.config.crsp.reward.generation_reward_config.remove_after_return,
+            'remove_input_from_snippet': self.config.crsp.reward.generation_reward_config.remove_input_from_snippet,
+            'include_references': self.config.crsp.reward.generation_reward_config.include_references,
         }
 
         # Add code_f specific parameters
         if problem_type == 'code_f':
             gen_params.update({
-                'num_inputs': self.config.azr.data_selection_strategy.num_inputs,
+                'num_inputs': self.config.crsp.data_selection_strategy.num_inputs,
             })
 
         get_gen_code_io_data(**gen_params)
@@ -729,7 +741,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             raise ValueError(f'Invalid problem type: {problem_type}')
         full_dataset = ray.get(self.dataset_manager.get_dataset.remote(dataset_key))
 
-        strategy = self.config.azr.pred_data_mix_strategy
+        strategy = self.config.crsp.pred_data_mix_strategy
 
         if strategy == "step":
             # Get entries with their creation steps
@@ -771,7 +783,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             io_data=selected_data,
             target_data_len=data_len,
             problem_type=problem_type,
-            content_max_length=self.config.azr.data_selection_strategy.content_max_length,
+            content_max_length=self.config.crsp.data_selection_strategy.content_max_length,
             output_path=parquet_path,
             split='train',
             tokenizer=self.tokenizer,
@@ -900,8 +912,8 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                     'problem_type': problem_type,
                     'executor': executor, # need this to check for execution errors
                     'rollout_actor_wg': self.actor_rollout_wg, # need this to estimate difficulty reward
-                    'banned_words': self.config.azr.data_selection_strategy.banned_words, # need this to check for banned words
-                    'n_samples': self.config.azr.reward.n_samples,
+                    'banned_words': self.config.crsp.data_selection_strategy.banned_words, # need this to check for banned words
+                    'n_samples': self.config.crsp.reward.n_samples,
                     'input_type_counters': input_type_counters,
                     'output_type_counters': output_type_counters,
                     'error_type_counters': error_type_counters,
@@ -922,9 +934,9 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                 train_metrics[f'{problem_type}/avg_program_lines'] = avg_program_lines
 
             # Log new programs if available
-            if valid_programs and self.config.azr.random_print_max_programs > 0:
+            if valid_programs and self.config.crsp.random_print_max_programs > 0:
                 PrettyPrinter.section_header(f"New {problem_type} Programs")
-                max_print = min(self.config.azr.random_print_max_programs, len(valid_programs))
+                max_print = min(self.config.crsp.random_print_max_programs, len(valid_programs))
                 for program in random.sample(valid_programs, max_print):
                     PrettyPrinter.status(f"PROBLEM TYPE", problem_type, "info")
                     if 'code_f' not in problem_type:
@@ -940,9 +952,9 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                         PrettyPrinter.status("MESSAGE", program['message'], "info")
                         PrettyPrinter.status("THOUGHT", program['thought'], "info")
                     print("\n" + "-"*80 + "\n")
-            if correct_predictions and self.config.azr.random_print_max_programs > 0:
+            if correct_predictions and self.config.crsp.random_print_max_programs > 0:
                 PrettyPrinter.section_header(f"New {problem_type} Programs")
-                max_print = min(self.config.azr.random_print_max_programs, len(correct_predictions))
+                max_print = min(self.config.crsp.random_print_max_programs, len(correct_predictions))
                 for program in random.sample(correct_predictions, max_print):
                     if 'code_f' not in problem_type:
                         PrettyPrinter.code_block(program['program'], "python")
@@ -983,18 +995,18 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             else:
                 raise ValueError(f'Invalid problem type: {problem_type}')
 
-            if self.config.azr.data_selection_strategy.max_programs is not None and problem_type.endswith('code_i'):
-                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.azr.data_selection_strategy.max_programs, 'input'))
-                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from input dataset, max programs is {self.config.azr.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
-            if self.config.azr.data_selection_strategy.max_programs is not None and problem_type.endswith('code_o'):
-                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.azr.data_selection_strategy.max_programs, 'output'))
-                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from output dataset, max programs is {self.config.azr.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
-            if self.config.azr.data_selection_strategy.max_programs is not None and problem_type.endswith('code_e'):
-                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.azr.data_selection_strategy.max_programs, 'error'))
-                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from error dataset, max programs is {self.config.azr.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
-            if self.config.azr.data_selection_strategy.max_programs is not None and problem_type.endswith('code_f'):
-                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.azr.data_selection_strategy.max_programs, 'problem'))
-                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from problem dataset, max programs is {self.config.azr.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
+            if self.config.crsp.data_selection_strategy.max_programs is not None and problem_type.endswith('code_i'):
+                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.crsp.data_selection_strategy.max_programs, 'input'))
+                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from input dataset, max programs is {self.config.crsp.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
+            if self.config.crsp.data_selection_strategy.max_programs is not None and problem_type.endswith('code_o'):
+                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.crsp.data_selection_strategy.max_programs, 'output'))
+                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from output dataset, max programs is {self.config.crsp.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
+            if self.config.crsp.data_selection_strategy.max_programs is not None and problem_type.endswith('code_e'):
+                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.crsp.data_selection_strategy.max_programs, 'error'))
+                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from error dataset, max programs is {self.config.crsp.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
+            if self.config.crsp.data_selection_strategy.max_programs is not None and problem_type.endswith('code_f'):
+                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.crsp.data_selection_strategy.max_programs, 'problem'))
+                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from problem dataset, max programs is {self.config.crsp.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
 
             train_metrics = {f'{problem_type}/{k}': np.mean(v) for k, v in train_metrics.items()}
             # log the number of valid programs added to the dataset
@@ -1056,7 +1068,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                 }
             ], self.global_steps))
 
-        target_size = self.config.azr.data_selection_strategy.data_len * self.config.azr.data_selection_strategy.seed_batch_factor
+        target_size = self.config.crsp.data_selection_strategy.data_len * self.config.crsp.data_selection_strategy.seed_batch_factor
 
         while problem_types != ['code_f']: # we can skip this loop if we are only generating code_f dataset
             # Get current dataset state
@@ -1115,23 +1127,23 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                         success, result = parse_code_input_output(
                             output_text,
                             parse_output=False,
-                            remove_after_return=self.config.azr.reward.generation_reward_config.remove_after_return,
-                            remove_comments=self.config.azr.reward.generation_reward_config.remove_comments,
-                            remove_print=self.config.azr.reward.generation_reward_config.remove_print,
-                            reject_multiple_functions=self.config.azr.reward.generation_reward_config.reject_multiple_functions,
-                            f_replace_location=self.config.azr.reward.generation_reward_config.f_replace_location,
-                            reject_test_input_in_code=self.config.azr.reward.generation_reward_config.reject_test_input_in_code,
-                            code_location=self.config.azr.reward.generation_reward_config.code_location,
+                            remove_after_return=self.config.crsp.reward.generation_reward_config.remove_after_return,
+                            remove_comments=self.config.crsp.reward.generation_reward_config.remove_comments,
+                            remove_print=self.config.crsp.reward.generation_reward_config.remove_print,
+                            reject_multiple_functions=self.config.crsp.reward.generation_reward_config.reject_multiple_functions,
+                            f_replace_location=self.config.crsp.reward.generation_reward_config.f_replace_location,
+                            reject_test_input_in_code=self.config.crsp.reward.generation_reward_config.reject_test_input_in_code,
+                            code_location=self.config.crsp.reward.generation_reward_config.code_location,
                         )
                         if success:
                             code_validity, output = self._executor.check_all(
                                 code=result['code'],
                                 inputs=result['input'],
-                                banned_keywords=self.config.azr.data_selection_strategy.banned_words,
+                                banned_keywords=self.config.crsp.data_selection_strategy.banned_words,
                                 check_determinism=True,
                                 imports=list(set(result['imports'])),
                                 check_error=problem_type == 'code_e',
-                                banned_keywords_for_errors_and_exceptions=self.config.azr.data_selection_strategy.banned_keywords_for_errors_and_exceptions,
+                                banned_keywords_for_errors_and_exceptions=self.config.crsp.data_selection_strategy.banned_keywords_for_errors_and_exceptions,
                             )
                             if code_validity:
                                 if problem_type == 'code_e':
@@ -1157,8 +1169,8 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                                         }
                                     )
 
-                    if self.config.azr.data_selection_strategy.get('generate_seed_dataset_only', False):
-                        with open(self.config.azr.data_selection_strategy.output_seed_path.replace('.jsonl', f'_temp.jsonl'), 'a') as f:
+                    if self.config.crsp.data_selection_strategy.get('generate_seed_dataset_only', False):
+                        with open(self.config.crsp.data_selection_strategy.output_seed_path.replace('.jsonl', f'_temp.jsonl'), 'a') as f:
                             for entry in local_entries:
                                 f.write(json.dumps(entry) + '\n')
 
@@ -1250,7 +1262,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                     output_ids = batch.batch['responses']
                     output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
                     for idx, output_text in enumerate(output_texts):
-                        success, result = parse_inputs_message(output_text, num_inputs=self.config.azr.data_selection_strategy.num_inputs)
+                        success, result = parse_inputs_message(output_text, num_inputs=self.config.crsp.data_selection_strategy.num_inputs)
                         if success:
                             outputs = []
                             for ipt in result['inputs']:
@@ -1292,8 +1304,8 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                     total=target_size,
                     label="Code F Dataset Growth"
                 )
-                if self.config.azr.data_selection_strategy.get('generate_seed_dataset_only', False):
-                    with open(self.config.azr.data_selection_strategy.output_code_f_seed_path.replace('.jsonl', f'_temp.jsonl'), 'a') as f:
+                if self.config.crsp.data_selection_strategy.get('generate_seed_dataset_only', False):
+                    with open(self.config.crsp.data_selection_strategy.output_code_f_seed_path.replace('.jsonl', f'_temp.jsonl'), 'a') as f:
                         for entry in code_f_dataset:
                             f.write(json.dumps(entry) + '\n')
                 # Early exit if we've reached target size
@@ -1338,9 +1350,9 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
         code_f_dataset = ray.get(self.dataset_manager.get_dataset.remote('problem'))
 
         # Modify dataset saving condition
-        if ('code_i' in problem_types or 'code_o' in problem_types) and self.config.azr.output_seed_path is not None:
+        if ('code_i' in problem_types or 'code_o' in problem_types) and self.config.crsp.output_seed_path is not None:
             PrettyPrinter.status("DATASET", "Writing seed dataset to JSONL file...", "info")
-            output_path = Path(self.config.azr.output_seed_path)
+            output_path = Path(self.config.crsp.output_seed_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
             with open(output_path, 'w') as f:
@@ -1348,18 +1360,18 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                     f.write(json.dumps(item) + '\n')
             PrettyPrinter.status("DATASET", f"Saved {len(seed_dataset)} entries to {str(output_path)}", "success")
 
-        if 'code_e' in problem_types and self.config.azr.output_error_seed_path is not None:
+        if 'code_e' in problem_types and self.config.crsp.output_error_seed_path is not None:
             PrettyPrinter.status("DATASET", "Writing error seed dataset to JSONL file...", "info")
-            output_path = Path(self.config.azr.output_error_seed_path)
+            output_path = Path(self.config.crsp.output_error_seed_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             with open(output_path, 'w') as f:
                 for item in error_dataset:
                     f.write(json.dumps(item) + '\n')
             PrettyPrinter.status("DATASET", f"Saved {len(error_dataset)} entries to {str(output_path)}", "success")
 
-        if 'code_f' in problem_types and self.config.azr.output_code_f_seed_path is not None:
+        if 'code_f' in problem_types and self.config.crsp.output_code_f_seed_path is not None:
             PrettyPrinter.status("DATASET", "Writing code f seed dataset to JSONL file...", "info")
-            output_path = Path(self.config.azr.output_code_f_seed_path)
+            output_path = Path(self.config.crsp.output_code_f_seed_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             with open(output_path, 'w') as f:
                 for item in code_f_dataset:
@@ -1379,7 +1391,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                 [
                     ["Total Samples", len(seed_dataset)],
                     ["Target Size", target_size],
-                    ["Storage Path", self.config.azr.output_seed_path],
+                    ["Storage Path", self.config.crsp.output_seed_path],
                     ["Sample Types", len(set(item['snippet'] for item in seed_dataset))],
                     ["Average Snippet Length", sum(len(item['snippet']) for item in seed_dataset) // len(seed_dataset) if seed_dataset else 0]
                 ],
@@ -1388,7 +1400,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
 
             PrettyPrinter.section_header("Sample Entries")
             # sample 3 entries
-            for i, item in enumerate(random.sample(seed_dataset, self.config.azr.random_print_max_programs)):  
+            for i, item in enumerate(random.sample(seed_dataset, self.config.crsp.random_print_max_programs)):  
                 PrettyPrinter.code_block(item['snippet'], "python")
                 PrettyPrinter.status("INPUT", item['input'], "info")
                 PrettyPrinter.status("OUTPUT", item['output'], "info")
@@ -1402,7 +1414,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                 [
                     ["Total Samples", len(error_dataset)],
                     ["Target Size", target_size],
-                    ["Storage Path", self.config.azr.output_error_seed_path],
+                    ["Storage Path", self.config.crsp.output_error_seed_path],
                     ["Sample Types", len(set(item['snippet'] for item in error_dataset))],
                     ["Average Snippet Length", sum(len(item['snippet']) for item in error_dataset) // len(error_dataset) if error_dataset else 0]
                 ],
@@ -1410,7 +1422,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             )
             PrettyPrinter.section_header("Error Sample Entries")
             # sample 3 entries
-            for i, item in enumerate(random.sample(error_dataset, self.config.azr.random_print_max_programs)):  
+            for i, item in enumerate(random.sample(error_dataset, self.config.crsp.random_print_max_programs)):  
                 PrettyPrinter.code_block(item['snippet'], "python")
                 PrettyPrinter.status("INPUT", item['input'], "info")
                 PrettyPrinter.status("OUTPUT", item['output'], "info")
@@ -1424,7 +1436,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                 [
                     ["Total Samples", len(code_f_dataset)],
                     ["Target Size", target_size],
-                    ["Storage Path", self.config.azr.output_code_f_seed_path],
+                    ["Storage Path", self.config.crsp.output_code_f_seed_path],
                     ["Sample Types", len(set(item['snippet'] for item in code_f_dataset))],
                     ["Average Snippet Length", sum(len(item['snippet']) for item in code_f_dataset) // len(code_f_dataset) if code_f_dataset else 0]
                 ],
@@ -1433,7 +1445,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
 
             PrettyPrinter.section_header("Code F Sample Entries")
             # sample 3 entries
-            for i, item in enumerate(random.sample(code_f_dataset, self.config.azr.random_print_max_programs)):  
+            for i, item in enumerate(random.sample(code_f_dataset, self.config.crsp.random_print_max_programs)):  
                 PrettyPrinter.code_block(item['snippet'], "python")
                 PrettyPrinter.status("INPUTS", item['inputs'], "info")
                 PrettyPrinter.status("OUTPUTS", item['outputs'], "info")
@@ -1492,9 +1504,9 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
         else:
             PrettyPrinter.section_header(f"Creating initial seed datasets")
             # create init dataset
-            need_seed_dataset = any(problem_type != 'code_e' for problem_type in self.config.azr.problem_types) or 'code_f' in self.config.azr.problem_types
-            need_error_dataset = 'code_e' in self.config.azr.problem_types
-            need_code_f_dataset = 'code_f' in self.config.azr.problem_types
+            need_seed_dataset = any(problem_type != 'code_e' for problem_type in self.config.crsp.problem_types) or 'code_f' in self.config.crsp.problem_types
+            need_error_dataset = 'code_e' in self.config.crsp.problem_types
+            need_code_f_dataset = 'code_f' in self.config.crsp.problem_types
 
             # Initialize with defaults
             seed_dataset = []
@@ -1503,37 +1515,37 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
 
             # Load or generate seed dataset if needed
             if need_seed_dataset:
-                if self.config.azr.seed_dataset is not None:
+                if self.config.crsp.seed_dataset is not None:
                     PrettyPrinter.status("DATA", "Loading seed dataset from file...", "info")
-                    with open(self.config.azr.seed_dataset, 'r') as file:
+                    with open(self.config.crsp.seed_dataset, 'r') as file:
                         seed_dataset = [json.loads(line) for line in file]
-                    seed_dataset = seed_dataset[:self.config.azr.data_selection_strategy.data_len * 
-                                                self.config.azr.data_selection_strategy.seed_batch_factor]
+                    seed_dataset = seed_dataset[:self.config.crsp.data_selection_strategy.data_len * 
+                                                self.config.crsp.data_selection_strategy.seed_batch_factor]
                     PrettyPrinter.status("DATA", f"Loaded {len(seed_dataset)} seed entries", "success")
-                    if 'code_f' in self.config.azr.problem_types: # we need seed to generate code_f
+                    if 'code_f' in self.config.crsp.problem_types: # we need seed to generate code_f
                         ray.get(self.dataset_manager.update_seed.remote(seed_dataset))
                 else:
                     PrettyPrinter.status("DATA", "Seed dataset not provided, will generate", "info")
 
             # Load or prepare to generate error dataset if needed
             if need_error_dataset:
-                if self.config.azr.error_seed_dataset is not None:
+                if self.config.crsp.error_seed_dataset is not None:
                     PrettyPrinter.status("DATA", "Loading error seed dataset from file...", "info")
-                    with open(self.config.azr.error_seed_dataset, 'r') as file:
+                    with open(self.config.crsp.error_seed_dataset, 'r') as file:
                         error_dataset = [json.loads(line) for line in file]
-                    error_dataset = error_dataset[:self.config.azr.data_selection_strategy.data_len * 
-                                                self.config.azr.data_selection_strategy.seed_batch_factor]
+                    error_dataset = error_dataset[:self.config.crsp.data_selection_strategy.data_len * 
+                                                self.config.crsp.data_selection_strategy.seed_batch_factor]
                     PrettyPrinter.status("DATA", f"Loaded {len(error_dataset)} error entries", "success")
                 else:
                     PrettyPrinter.status("DATA", "Error seed dataset not provided, will generate", "info")
 
             if need_code_f_dataset:
-                if self.config.azr.code_f_seed_dataset is not None:
+                if self.config.crsp.code_f_seed_dataset is not None:
                     PrettyPrinter.status("DATA", "Loading code f seed dataset from file...", "info")
-                    with open(self.config.azr.code_f_seed_dataset, 'r') as file:
+                    with open(self.config.crsp.code_f_seed_dataset, 'r') as file:
                         code_f_dataset = [json.loads(line) for line in file]
-                    code_f_dataset = code_f_dataset[:self.config.azr.data_selection_strategy.data_len * 
-                                                self.config.azr.data_selection_strategy.seed_batch_factor]
+                    code_f_dataset = code_f_dataset[:self.config.crsp.data_selection_strategy.data_len * 
+                                                self.config.crsp.data_selection_strategy.seed_batch_factor]
                     PrettyPrinter.status("DATA", f"Loaded {len(code_f_dataset)} code f entries", "success")
 
             # Generate missing datasets if needed
@@ -1543,7 +1555,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
 
             if need_to_generate_seed or need_to_generate_error or need_to_generate_code_f:
                 sample_problem_types = []
-                for problem_type in self.config.azr.problem_types:
+                for problem_type in self.config.crsp.problem_types:
                     if problem_type == 'code_e' and need_to_generate_error:
                         sample_problem_types.append(problem_type)
                     elif problem_type != 'code_e' and need_to_generate_seed:
@@ -1565,14 +1577,14 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                     code_f_dataset = generated_code_f
                     PrettyPrinter.status("DATA", f"Generated {len(code_f_dataset)} code f entries", "success")
 
-                if self.config.azr.get('generate_seed_dataset_only', False):
+                if self.config.crsp.get('generate_seed_dataset_only', False):
                     return
 
             # Now initialize datasets in dataset manager
             if need_seed_dataset:
-                assert len(seed_dataset) >= self.config.azr.data_selection_strategy.data_len
+                assert len(seed_dataset) >= self.config.crsp.data_selection_strategy.data_len
 
-                if 'code_i' in self.config.azr.problem_types:
+                if 'code_i' in self.config.crsp.problem_types:
                     # Process locally first
                     processed_seed_dataset = process_elements(seed_dataset)
                     # Initialize input dataset with seed data
@@ -1583,7 +1595,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                         "success"
                     )
 
-                if 'code_o' in self.config.azr.problem_types:
+                if 'code_o' in self.config.crsp.problem_types:
                     processed_seed_dataset = process_elements(seed_dataset)
                     ray.get(self.dataset_manager.add_output_batch.remote(processed_seed_dataset, self.global_steps))
                     PrettyPrinter.status(
@@ -1593,7 +1605,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                     )
 
             if need_error_dataset:
-                assert len(error_dataset) >= self.config.azr.data_selection_strategy.data_len
+                assert len(error_dataset) >= self.config.crsp.data_selection_strategy.data_len
                 processed_error_dataset = process_elements(error_dataset)
                 ray.get(self.dataset_manager.add_error_batch.remote(processed_error_dataset, self.global_steps))
                 PrettyPrinter.status(
@@ -1603,7 +1615,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                 )
 
             if need_code_f_dataset:
-                assert len(code_f_dataset) >= self.config.azr.data_selection_strategy.data_len
+                assert len(code_f_dataset) >= self.config.crsp.data_selection_strategy.data_len
                 processed_code_f_dataset = process_elements(code_f_dataset)
                 ray.get(self.dataset_manager.add_problem_batch.remote(processed_code_f_dataset, self.global_steps))
                 PrettyPrinter.status(
@@ -1614,14 +1626,14 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
 
         # we start from step 1
         self.global_steps += 1
-        if self.config.azr.pretrain_pred_steps > 0 and self.global_steps <= self.config.azr.pretrain_pred_steps:
+        if self.config.crsp.pretrain_pred_steps > 0 and self.global_steps <= self.config.crsp.pretrain_pred_steps:
             self.pretrain_pred = True
         else:
             self.pretrain_pred = False
 
         while self.global_steps < self.total_training_steps:
             PrettyPrinter.section_header(f"Training Step {self.global_steps}")
-            if self.config.azr.data_selection_strategy.composite_scheduler.enabled:
+            if self.config.crsp.data_selection_strategy.composite_scheduler.enabled:
                 self.scheduler_step()
 
             PrettyPrinter.progress_bar(
@@ -1630,8 +1642,8 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                 label="Training Progress"
             )
 
-            data_len = self.config.data.train_batch_size * self.config.azr.data_selection_strategy.update_iteration
-            if 'code_i' in self.config.azr.problem_types:
+            data_len = self.config.data.train_batch_size * self.config.crsp.data_selection_strategy.update_iteration
+            if 'code_i' in self.config.crsp.problem_types:
                 gen_code_i_dataloader = self._create_train_code_gen_dataloader(
                     problem_type='code_i',
                     data_len=data_len,
@@ -1640,7 +1652,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                     problem_type='code_i',
                     data_len=data_len,
                 )
-            if 'code_o' in self.config.azr.problem_types:
+            if 'code_o' in self.config.crsp.problem_types:
                 gen_code_o_dataloader = self._create_train_code_gen_dataloader(
                     problem_type='code_o',
                     data_len=data_len,
@@ -1650,7 +1662,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                     data_len=data_len,
                 )
 
-            if 'code_e' in self.config.azr.problem_types:
+            if 'code_e' in self.config.crsp.problem_types:
                 gen_code_e_dataloader = self._create_train_code_gen_dataloader(
                     problem_type='code_e',
                     data_len=data_len,
@@ -1660,7 +1672,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                     data_len=data_len,
                 )
 
-            if 'code_f' in self.config.azr.problem_types:
+            if 'code_f' in self.config.crsp.problem_types:
                 gen_code_f_dataloader = self._create_train_code_gen_dataloader(
                     data_len=data_len,
                     problem_type='code_f',
@@ -1670,7 +1682,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                     problem_type='code_f',
                     data_len=data_len,
                 )
-            for _ in range(self.config.azr.data_selection_strategy.update_iteration):
+            for _ in range(self.config.crsp.data_selection_strategy.update_iteration):
                 metrics = {}
                 timing_raw = {}
                 batches = {}
@@ -1682,48 +1694,48 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                             self.cleanup()
                         self._last_cleanup_step = self.global_steps
 
-                    if 'code_i' in self.config.azr.problem_types:
+                    if 'code_i' in self.config.crsp.problem_types:
                         if not self.pretrain_pred:
                             batch_dict = next(gen_code_i_dataloader)
                             batch: DataProto = DataProto.from_single_dict(batch_dict)
                             batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_i', executor=self._executor)
-                            if self.config.azr.train_propose:
+                            if self.config.crsp.train_propose:
                                 batches[f'gen_code_i'] = batch
                         batch_dict = next(pred_code_i_dataloader)
                         batch: DataProto = DataProto.from_single_dict(batch_dict)
                         batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='pred_code_i', executor=self._executor)
                         batches[f'pred_code_i'] = batch
 
-                    if 'code_o' in self.config.azr.problem_types:
+                    if 'code_o' in self.config.crsp.problem_types:
                         if not self.pretrain_pred:
                             batch_dict = next(gen_code_o_dataloader)
                             batch: DataProto = DataProto.from_single_dict(batch_dict)
                             batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_o', executor=self._executor)
-                            if self.config.azr.train_propose:
+                            if self.config.crsp.train_propose:
                                 batches[f'gen_code_o'] = batch
                         batch_dict = next(pred_code_o_dataloader)
                         batch: DataProto = DataProto.from_single_dict(batch_dict)
                         batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='pred_code_o', executor=self._executor)
                         batches[f'pred_code_o'] = batch
 
-                    if 'code_e' in self.config.azr.problem_types:
+                    if 'code_e' in self.config.crsp.problem_types:
                         if not self.pretrain_pred:
                             batch_dict = next(gen_code_e_dataloader)
                             batch: DataProto = DataProto.from_single_dict(batch_dict)
                             batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_e', executor=self._executor)
-                            if self.config.azr.train_propose:
+                            if self.config.crsp.train_propose:
                                 batches[f'gen_code_e'] = batch
                         batch_dict = next(pred_code_e_dataloader)
                         batch: DataProto = DataProto.from_single_dict(batch_dict)
                         batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='pred_code_e', executor=self._executor)
                         batches[f'pred_code_e'] = batch
 
-                    if 'code_f' in self.config.azr.problem_types:
+                    if 'code_f' in self.config.crsp.problem_types:
                         if not self.pretrain_pred:
                             batch_dict = next(gen_code_f_dataloader)
                             batch: DataProto = DataProto.from_single_dict(batch_dict)
                             batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_f', executor=self._executor)
-                            if self.config.azr.train_propose:
+                            if self.config.crsp.train_propose:
                                 batches[f'gen_code_f'] = batch
                         batch_dict = next(pred_code_f_dataloader)
                         batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -1762,25 +1774,25 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                         metrics.update(val_metrics)
 
                     # print the statistics of the number of programs in the dataset
-                    if 'code_i' in self.config.azr.problem_types:
+                    if 'code_i' in self.config.crsp.problem_types:
                         PrettyPrinter.status(
                             "DATA", 
                             f"Number of programs in the input dataset: {ray.get(self.dataset_manager.get_dataset_size.remote('input'))}", 
                             "info"
                         )
-                    if 'code_o' in self.config.azr.problem_types:
+                    if 'code_o' in self.config.crsp.problem_types:
                         PrettyPrinter.status(
                             "DATA", 
                             f"Number of programs in the output dataset: {ray.get(self.dataset_manager.get_dataset_size.remote('output'))}", 
                             "info"
                         )
-                    if 'code_e' in self.config.azr.problem_types:
+                    if 'code_e' in self.config.crsp.problem_types:
                         PrettyPrinter.status(
                             "DATA", 
                             f"Number of programs in the error dataset: {ray.get(self.dataset_manager.get_dataset_size.remote('error'))}", 
                             "info"
                         )
-                    if 'code_f' in self.config.azr.problem_types:
+                    if 'code_f' in self.config.crsp.problem_types:
                         PrettyPrinter.status(
                             "DATA", 
                             f"Number of programs in the code_f dataset: {ray.get(self.dataset_manager.get_dataset_size.remote('problem'))}", 
@@ -1793,19 +1805,19 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
 
                 # collect metrics, separate problem types
                 all_types = []
-                if 'code_i' in self.config.azr.problem_types:
+                if 'code_i' in self.config.crsp.problem_types:
                     if not self.pretrain_pred:
                         all_types.append('gen_code_i')
                     all_types.append('pred_code_i')
-                if 'code_o' in self.config.azr.problem_types:
+                if 'code_o' in self.config.crsp.problem_types:
                     if not self.pretrain_pred:
                         all_types.append('gen_code_o')
                     all_types.append('pred_code_o')
-                if 'code_e' in self.config.azr.problem_types:
+                if 'code_e' in self.config.crsp.problem_types:
                     if not self.pretrain_pred:
                         all_types.append('gen_code_e')
                     all_types.append('pred_code_e')
-                if 'code_f' in self.config.azr.problem_types:
+                if 'code_f' in self.config.crsp.problem_types:
                     if not self.pretrain_pred:
                         all_types.append('gen_code_f')
                     all_types.append('pred_code_f')
@@ -1868,7 +1880,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
 
                 logger.log(data=metrics, step=self.global_steps)
 
-                if self.global_steps >= self.config.azr.pretrain_pred_steps:
+                if self.global_steps >= self.config.crsp.pretrain_pred_steps:
                     self.pretrain_pred = False
 
                 self.global_steps += 1
@@ -2064,34 +2076,34 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             PrettyPrinter.status("Directory", f"Created new code directory at {code_dir}", "info")
 
     def scheduler_step(self):
-        if self.config.azr.data_selection_strategy.composite_scheduler.enabled:
+        if self.config.crsp.data_selection_strategy.composite_scheduler.enabled:
             # Update number of programs - calculate directly based on global steps
-            if self.global_steps >= self.config.azr.data_selection_strategy.composite_scheduler.update_num_programs_start:
-                steps_since_start = self.global_steps - self.config.azr.data_selection_strategy.composite_scheduler.update_num_programs_start
-                num_updates = steps_since_start // self.config.azr.data_selection_strategy.composite_scheduler.update_num_programs_interval
+            if self.global_steps >= self.config.crsp.data_selection_strategy.composite_scheduler.update_num_programs_start:
+                steps_since_start = self.global_steps - self.config.crsp.data_selection_strategy.composite_scheduler.update_num_programs_start
+                num_updates = steps_since_start // self.config.crsp.data_selection_strategy.composite_scheduler.update_num_programs_interval
 
                 # Calculate new value directly from initial value + increments
-                initial_max = self.config.azr.data_selection_strategy.max_programs_initial
-                new_max = min(initial_max + num_updates, self.config.azr.data_selection_strategy.composite_scheduler.num_programs_max)
+                initial_max = self.config.crsp.data_selection_strategy.max_programs_initial
+                new_max = min(initial_max + num_updates, self.config.crsp.data_selection_strategy.composite_scheduler.num_programs_max)
 
                 # Only log if value changed
-                if new_max != self.config.azr.data_selection_strategy.composite_function_n_max:
-                    current_max = self.config.azr.data_selection_strategy.composite_function_n_max
-                    self.config.azr.data_selection_strategy.composite_function_n_max = new_max
+                if new_max != self.config.crsp.data_selection_strategy.composite_function_n_max:
+                    current_max = self.config.crsp.data_selection_strategy.composite_function_n_max
+                    self.config.crsp.data_selection_strategy.composite_function_n_max = new_max
                     PrettyPrinter.status("Scheduler", f"Updated max programs from {current_max} to {new_max}", "info")
 
             # Update composite probability - calculate directly based on global steps
-            if self.global_steps >= self.config.azr.data_selection_strategy.composite_scheduler.update_probability_start:
-                steps_since_start = self.global_steps - self.config.azr.data_selection_strategy.composite_scheduler.update_probability_start
-                num_updates = steps_since_start // self.config.azr.data_selection_strategy.composite_scheduler.update_probability_interval
+            if self.global_steps >= self.config.crsp.data_selection_strategy.composite_scheduler.update_probability_start:
+                steps_since_start = self.global_steps - self.config.crsp.data_selection_strategy.composite_scheduler.update_probability_start
+                num_updates = steps_since_start // self.config.crsp.data_selection_strategy.composite_scheduler.update_probability_interval
 
                 # Calculate new value directly from initial value + increments
-                initial_prob = self.config.azr.data_selection_strategy.composite_chance_initial
-                new_prob = min(initial_prob + (num_updates * self.config.azr.data_selection_strategy.composite_scheduler.update_probability_increment),
-                              self.config.azr.data_selection_strategy.composite_scheduler.update_probability_max)
+                initial_prob = self.config.crsp.data_selection_strategy.composite_chance_initial
+                new_prob = min(initial_prob + (num_updates * self.config.crsp.data_selection_strategy.composite_scheduler.update_probability_increment),
+                              self.config.crsp.data_selection_strategy.composite_scheduler.update_probability_max)
 
                 # Only log if value changed
-                if new_prob != self.config.azr.data_selection_strategy.composite_chance:
-                    current_prob = self.config.azr.data_selection_strategy.composite_chance
-                    self.config.azr.data_selection_strategy.composite_chance = new_prob
+                if new_prob != self.config.crsp.data_selection_strategy.composite_chance:
+                    current_prob = self.config.crsp.data_selection_strategy.composite_chance
+                    self.config.crsp.data_selection_strategy.composite_chance = new_prob
                     PrettyPrinter.status("Scheduler", f"Updated composite probability from {current_prob:.2f} to {new_prob:.2f}", "info")

@@ -1,4 +1,6 @@
 import os
+import logging
+import json
 from functools import partial
 from typing import Dict, Any, List, Tuple
 from collections import defaultdict
@@ -15,8 +17,8 @@ from verl.protocol import DataProtoItem
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
-import absolute_zero_reasoner.rewards.custom_evaluate as custom_evaluate
-from absolute_zero_reasoner.rewards.code_reward import (
+import rewarded_self_play.rewards.custom_evaluate as custom_evaluate
+from rewarded_self_play.rewards.code_reward import (
     parse_code_input_output,
     parse_inputs_message,
     parse_code_function,
@@ -25,12 +27,382 @@ from absolute_zero_reasoner.rewards.code_reward import (
     get_halstead_reward,
     get_type_counts_reward,
 )
-from absolute_zero_reasoner.rewards.custom_evaluate import get_format_reward, extract_answer, extract_thought
-from absolute_zero_reasoner.data_construction.process_data import boxed_instruction, instruction_following
-from absolute_zero_reasoner.data_construction.constructor import get_code_problem_predictor_prompt
-from absolute_zero_reasoner.utils.dataset.rl_dataset import RLHFDataset
-from absolute_zero_reasoner.utils.logging_utils.stdout import PrettyPrinter
-from absolute_zero_reasoner.utils.code_utils.checks import check_composite_function, check_no_definitions
+from rewarded_self_play.rewards.custom_evaluate import get_format_reward, extract_answer, extract_thought
+from rewarded_self_play.data_construction.process_data import boxed_instruction, instruction_following
+from rewarded_self_play.data_construction.constructor import get_code_problem_predictor_prompt
+from rewarded_self_play.utils.dataset.rl_dataset import RLHFDataset
+from rewarded_self_play.utils.logging_utils.stdout import PrettyPrinter
+from rewarded_self_play.utils.code_utils.checks import check_composite_function, check_no_definitions
+from rewarded_self_play.data_construction.prompts import get_creativity_grading_prompt
+
+
+class CritiqueManager:
+    """Manager for evaluating reasoning quality and creativity."""
+    
+    def __init__(self, tokenizer: AutoTokenizer):
+        self.tokenizer = tokenizer
+    
+    @staticmethod
+    def extract_think_tags(solution_text: str) -> str:
+        """
+        Extract content within <think> tags from solution text.
+        
+        Args:
+            solution_text: The solution text containing <think> tags
+            
+        Returns:
+            The reasoning content within <think> tags, or empty string if not found
+        """
+        think_pattern = r'<think>(.*?)</think>'
+        think_matches = re.findall(think_pattern, solution_text, re.DOTALL)
+        
+        if think_matches:
+            return think_matches[0].strip()
+        return ""
+    
+    def evaluate_reasoning(self, solution_text: str, model=None) -> Tuple[float, str]:
+        """
+        Evaluate the reasoning trajectory within <think> tags.
+        
+        Args:
+            solution_text: The solution text containing <think> tags
+            model: The model to use for evaluation (if None, returns default score)
+            
+        Returns:
+            Tuple of (creativity_score, rationale)
+        """
+        think_content = self.extract_think_tags(solution_text)
+        
+        if not think_content:
+            return 0.0, "No reasoning content found in <think> tags"
+        
+        if model is None:
+            # Return a default score based on length and complexity heuristics
+            tokens = self.tokenizer.encode(think_content)
+            token_count = len(tokens)
+            
+            # Simple heuristic: longer reasoning gets higher creativity score
+            if token_count < 10:
+                return 0.1, "Very short reasoning"
+            elif token_count < 50:
+                return 0.3, "Short reasoning with some detail"
+            elif token_count < 200:
+                return 0.6, "Moderate reasoning with good detail"
+            else:
+                return 0.8, "Extensive reasoning with thorough exploration"
+        
+        # If model is provided, use it for evaluation
+        try:
+            prompt = get_creativity_grading_prompt(think_content)
+            response = model.generate(prompt)
+            
+            # Parse JSON response
+            import json
+            evaluation = json.loads(response)
+            return evaluation.get('grade', 0.0), evaluation.get('rationale', 'No rationale provided')
+        except Exception as e:
+            # Fallback to heuristic if model evaluation fails
+            return 0.5, f"Model evaluation failed: {str(e)}"
+    
+    def compute_creativity_reward(self, solution_text: str, model=None) -> float:
+        """
+        Compute creativity reward based on reasoning evaluation.
+        
+        Args:
+            solution_text: The solution text to evaluate
+            model: Optional model for evaluation
+            
+        Returns:
+            Creativity reward score between 0 and 1
+        """
+        creativity_score, _ = self.evaluate_reasoning(solution_text, model)
+        return creativity_score
+
+
+class AlphaDecayScheduler:
+    """RLSP-inspired alpha decay scheduler for CRSP."""
+    
+    @staticmethod
+    def compute_alpha_decay(step: int, total_steps: int) -> Tuple[float, float]:
+        """
+        Compute alpha values for solver and critique rewards using RLSP-inspired coupled decay.
+        
+        Args:
+            step: Current training step
+            total_steps: Total number of training steps
+            
+        Returns:
+            Tuple of (alpha_s, alpha_c) values
+        """
+        progress = step / total_steps
+        
+        if progress < 0.2:
+            # Early exploration phase
+            alpha_s, alpha_c = 0.3, 0.1
+        elif progress < 0.6:
+            # Interpolation phase
+            phase_progress = (progress - 0.2) / 0.4
+            alpha_s = 0.3 + 0.5 * phase_progress  # 0.3 → 0.8
+            alpha_c = 0.1 + 0.5 * phase_progress  # 0.1 → 0.6
+        else:
+            # Final convergence phase
+            phase_progress = (progress - 0.6) / 0.4
+            alpha_s = 0.8 + 0.15 * phase_progress  # 0.8 → 0.95
+            alpha_c = 0.6 + 0.2 * phase_progress   # 0.6 → 0.8
+        
+        return alpha_s, alpha_c
+
+
+class CRSPLogger:
+    """Comprehensive logging for CRSP training metrics."""
+    
+    def __init__(self, output_dir: str, log_level: str = "INFO"):
+        self.output_dir = output_dir
+        self.logger = logging.getLogger("CRSP")
+        self.logger.setLevel(getattr(logging, log_level.upper()))
+        
+        # Create file handler for detailed logs
+        os.makedirs(output_dir, exist_ok=True)
+        file_handler = logging.FileHandler(os.path.join(output_dir, "crsp_training.log"))
+        file_handler.setLevel(logging.DEBUG)
+        
+        # Create console handler for important messages
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        
+        # Create formatter
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
+        
+        # Add handlers to logger
+        if not self.logger.handlers:
+            self.logger.addHandler(file_handler)
+            self.logger.addHandler(console_handler)
+        
+        # Initialize metrics storage
+        self.metrics_history = {
+            'rewards': [],
+            'alpha_values': [],
+            'creativity_scores': [],
+            'length_rewards': [],
+            'tr_rpg_metrics': [],
+            'trajectory_seeding': []
+        }
+    
+    def log_reward_breakdown(self, step: int, rewards: Dict[str, float], alpha_s: float, alpha_c: float):
+        """Log detailed reward breakdown for debugging and monitoring."""
+        self.logger.info(f"Step {step} - Reward Breakdown:")
+        self.logger.info(f"  Alpha values: α_s={alpha_s:.3f}, α_c={alpha_c:.3f}")
+        
+        for reward_type, value in rewards.items():
+            self.logger.info(f"  {reward_type}: {value:.4f}")
+        
+        # Store for history
+        self.metrics_history['rewards'].append({
+            'step': step,
+            'rewards': rewards.copy(),
+            'timestamp': pd.Timestamp.now()
+        })
+        self.metrics_history['alpha_values'].append({
+            'step': step,
+            'alpha_s': alpha_s,
+            'alpha_c': alpha_c,
+            'timestamp': pd.Timestamp.now()
+        })
+    
+    def log_creativity_evaluation(self, step: int, creativity_scores: List[float], rationales: List[str]):
+        """Log creativity evaluation results."""
+        avg_creativity = np.mean(creativity_scores)
+        std_creativity = np.std(creativity_scores)
+        
+        self.logger.info(f"Step {step} - Creativity Evaluation:")
+        self.logger.info(f"  Average creativity score: {avg_creativity:.4f} ± {std_creativity:.4f}")
+        self.logger.info(f"  Score distribution: min={min(creativity_scores):.3f}, "
+                        f"max={max(creativity_scores):.3f}, median={np.median(creativity_scores):.3f}")
+        
+        # Log sample rationales
+        if rationales:
+            self.logger.debug("Sample creativity rationales:")
+            for i, rationale in enumerate(rationales[:3]):  # Log first 3 rationales
+                self.logger.debug(f"  Sample {i+1}: {rationale}")
+        
+        # Store for history
+        self.metrics_history['creativity_scores'].append({
+            'step': step,
+            'scores': creativity_scores.copy(),
+            'avg_score': avg_creativity,
+            'std_score': std_creativity,
+            'timestamp': pd.Timestamp.now()
+        })
+    
+    def log_length_rewards(self, step: int, length_rewards: List[float], token_counts: List[int]):
+        """Log length reward statistics."""
+        avg_length_reward = np.mean(length_rewards)
+        avg_token_count = np.mean(token_counts)
+        
+        self.logger.info(f"Step {step} - Length Rewards:")
+        self.logger.info(f"  Average length reward: {avg_length_reward:.4f}")
+        self.logger.info(f"  Average token count: {avg_token_count:.1f}")
+        self.logger.info(f"  Token count range: {min(token_counts)}-{max(token_counts)}")
+        
+        # Store for history
+        self.metrics_history['length_rewards'].append({
+            'step': step,
+            'length_rewards': length_rewards.copy(),
+            'token_counts': token_counts.copy(),
+            'avg_length_reward': avg_length_reward,
+            'avg_token_count': avg_token_count,
+            'timestamp': pd.Timestamp.now()
+        })
+    
+    def log_tr_rpg_metrics(self, step: int, kl_divergences: Dict[str, float], 
+                          importance_weights: Dict[str, List[float]], policy_losses: Dict[str, float]):
+        """Log TR-RPG specific metrics."""
+        self.logger.info(f"Step {step} - TR-RPG Metrics:")
+        
+        # Log KL divergences
+        for policy, kl_div in kl_divergences.items():
+            self.logger.info(f"  KL divergence ({policy}): {kl_div:.6f}")
+        
+        # Log importance weight statistics
+        for policy, weights in importance_weights.items():
+            if weights:
+                avg_weight = np.mean(weights)
+                max_weight = np.max(weights)
+                self.logger.info(f"  Importance weights ({policy}): avg={avg_weight:.4f}, max={max_weight:.4f}")
+        
+        # Log policy losses
+        for policy, loss in policy_losses.items():
+            self.logger.info(f"  Policy loss ({policy}): {loss:.6f}")
+        
+        # Store for history
+        self.metrics_history['tr_rpg_metrics'].append({
+            'step': step,
+            'kl_divergences': kl_divergences.copy(),
+            'importance_weights': {k: v.copy() if isinstance(v, list) else v for k, v in importance_weights.items()},
+            'policy_losses': policy_losses.copy(),
+            'timestamp': pd.Timestamp.now()
+        })
+    
+    def log_trajectory_seeding_progress(self, epoch: int, loss: float, eval_loss: float = None, 
+                                      learning_rate: float = None):
+        """Log trajectory seeding progress."""
+        self.logger.info(f"Trajectory Seeding - Epoch {epoch}:")
+        self.logger.info(f"  Training loss: {loss:.6f}")
+        if eval_loss is not None:
+            self.logger.info(f"  Validation loss: {eval_loss:.6f}")
+        if learning_rate is not None:
+            self.logger.info(f"  Learning rate: {learning_rate:.2e}")
+        
+        # Store for history
+        self.metrics_history['trajectory_seeding'].append({
+            'epoch': epoch,
+            'loss': loss,
+            'eval_loss': eval_loss,
+            'learning_rate': learning_rate,
+            'timestamp': pd.Timestamp.now()
+        })
+    
+    def save_metrics_summary(self, step: int):
+        """Save comprehensive metrics summary to file."""
+        summary_path = os.path.join(self.output_dir, f"metrics_summary_step_{step}.json")
+        
+        # Create summary statistics
+        summary = {
+            'step': step,
+            'timestamp': pd.Timestamp.now().isoformat(),
+            'reward_stats': self._compute_reward_stats(),
+            'alpha_progression': self._compute_alpha_progression(),
+            'creativity_trends': self._compute_creativity_trends(),
+            'tr_rpg_stability': self._compute_tr_rpg_stability()
+        }
+        
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2, default=str)
+        
+        self.logger.info(f"Metrics summary saved to: {summary_path}")
+    
+    def _compute_reward_stats(self) -> Dict[str, Any]:
+        """Compute reward statistics over recent history."""
+        if not self.metrics_history['rewards']:
+            return {}
+        
+        recent_rewards = self.metrics_history['rewards'][-100:]  # Last 100 steps
+        reward_types = set()
+        for entry in recent_rewards:
+            reward_types.update(entry['rewards'].keys())
+        
+        stats = {}
+        for reward_type in reward_types:
+            values = [entry['rewards'].get(reward_type, 0) for entry in recent_rewards]
+            stats[reward_type] = {
+                'mean': np.mean(values),
+                'std': np.std(values),
+                'min': np.min(values),
+                'max': np.max(values)
+            }
+        
+        return stats
+    
+    def _compute_alpha_progression(self) -> Dict[str, Any]:
+        """Compute alpha value progression."""
+        if not self.metrics_history['alpha_values']:
+            return {}
+        
+        recent_alphas = self.metrics_history['alpha_values'][-50:]  # Last 50 steps
+        alpha_s_values = [entry['alpha_s'] for entry in recent_alphas]
+        alpha_c_values = [entry['alpha_c'] for entry in recent_alphas]
+        
+        return {
+            'alpha_s': {
+                'current': alpha_s_values[-1] if alpha_s_values else 0,
+                'trend': np.polyfit(range(len(alpha_s_values)), alpha_s_values, 1)[0] if len(alpha_s_values) > 1 else 0
+            },
+            'alpha_c': {
+                'current': alpha_c_values[-1] if alpha_c_values else 0,
+                'trend': np.polyfit(range(len(alpha_c_values)), alpha_c_values, 1)[0] if len(alpha_c_values) > 1 else 0
+            }
+        }
+    
+    def _compute_creativity_trends(self) -> Dict[str, Any]:
+        """Compute creativity score trends."""
+        if not self.metrics_history['creativity_scores']:
+            return {}
+        
+        recent_creativity = self.metrics_history['creativity_scores'][-20:]  # Last 20 evaluations
+        avg_scores = [entry['avg_score'] for entry in recent_creativity]
+        
+        return {
+            'current_avg': avg_scores[-1] if avg_scores else 0,
+            'trend': np.polyfit(range(len(avg_scores)), avg_scores, 1)[0] if len(avg_scores) > 1 else 0,
+            'improvement': avg_scores[-1] - avg_scores[0] if len(avg_scores) > 1 else 0
+        }
+    
+    def _compute_tr_rpg_stability(self) -> Dict[str, Any]:
+        """Compute TR-RPG training stability metrics."""
+        if not self.metrics_history['tr_rpg_metrics']:
+            return {}
+        
+        recent_metrics = self.metrics_history['tr_rpg_metrics'][-10:]  # Last 10 steps
+        
+        # Compute KL divergence stability
+        kl_stability = {}
+        for policy in ['propose', 'solve', 'critique']:
+            kl_values = [entry['kl_divergences'].get(policy, 0) for entry in recent_metrics]
+            if kl_values:
+                kl_stability[policy] = {
+                    'mean': np.mean(kl_values),
+                    'std': np.std(kl_values),
+                    'stability_score': 1.0 / (1.0 + np.std(kl_values))  # Higher is more stable
+                }
+        
+        return {
+            'kl_stability': kl_stability,
+            'overall_stability': np.mean([v['stability_score'] for v in kl_stability.values()]) if kl_stability else 0
+        }
 
 
 class CodeIORewardManager():
@@ -71,6 +443,295 @@ class CodeIORewardManager():
         self.num_inputs = num_inputs
         self.code_f_reward_type = code_f_reward_type
         self.boxed_retry = boxed_retry
+        
+        # Initialize CRSP components
+        self.critique_manager = CritiqueManager(tokenizer)
+        self.alpha_scheduler = AlphaDecayScheduler()
+        self.crsp_logger = CRSPLogger(output_path, log_level="INFO")
+        
+        # Initialize running statistics for reward normalization
+        self.running_stats = {
+            'correctness': {'mean': 0.5, 'std': 0.5},
+            'length': {'mean': 0.5, 'std': 0.3},
+            'creativity': {'mean': 0.5, 'std': 0.3},
+            'solver_reward': {'mean': 0.5, 'std': 0.3},
+            'critique_reward': {'mean': 0.5, 'std': 0.3}
+        }
+        
+        # Initialize step counter for logging
+        self.current_step = 0
+        self.total_steps = 1000  # Will be updated during training
+    
+    def update_training_progress(self, step: int, total_steps: int):
+        """Update training progress for logging and alpha decay."""
+        self.current_step = step
+        self.total_steps = total_steps
+    
+    def log_comprehensive_metrics(self, step: int, batch_rewards: List[Dict[str, float]], 
+                                 batch_solutions: List[str], tr_rpg_metrics: Dict[str, Any] = None):
+        """
+        Log comprehensive CRSP metrics for a training batch.
+        
+        Args:
+            step: Current training step
+            batch_rewards: List of reward dictionaries for each sample in batch
+            batch_solutions: List of solution texts for each sample
+            tr_rpg_metrics: Optional TR-RPG specific metrics
+        """
+        if not batch_rewards:
+            return
+        
+        # Extract metrics from batch
+        correctness_scores = [r.get('correctness', 0) for r in batch_rewards]
+        length_rewards = [r.get('length_reward', 0) for r in batch_rewards]
+        creativity_scores = [r.get('creativity_reward', 0) for r in batch_rewards]
+        solver_rewards = [r.get('solver_reward', 0) for r in batch_rewards]
+        critique_rewards = [r.get('critique_reward', 0) for r in batch_rewards]
+        
+        # Get alpha values for this step
+        alpha_s, alpha_c = self.alpha_scheduler.compute_alpha_decay(step, self.total_steps)
+        
+        # Compute token counts for length analysis
+        token_counts = []
+        for solution in batch_solutions:
+            tokens = self.tokenizer.encode(solution)
+            token_counts.append(len(tokens))
+        
+        # Log reward breakdown
+        avg_rewards = {
+            'correctness': np.mean(correctness_scores),
+            'length_reward': np.mean(length_rewards),
+            'creativity_reward': np.mean(creativity_scores),
+            'solver_reward': np.mean(solver_rewards),
+            'critique_reward': np.mean(critique_rewards)
+        }
+        self.crsp_logger.log_reward_breakdown(step, avg_rewards, alpha_s, alpha_c)
+        
+        # Log creativity evaluation
+        rationales = [f"Score: {score:.3f}" for score in creativity_scores]  # Simplified rationales
+        self.crsp_logger.log_creativity_evaluation(step, creativity_scores, rationales)
+        
+        # Log length rewards
+        self.crsp_logger.log_length_rewards(step, length_rewards, token_counts)
+        
+        # Log TR-RPG metrics if provided
+        if tr_rpg_metrics:
+            kl_divergences = tr_rpg_metrics.get('kl_divergences', {})
+            importance_weights = tr_rpg_metrics.get('importance_weights', {})
+            policy_losses = tr_rpg_metrics.get('policy_losses', {})
+            self.crsp_logger.log_tr_rpg_metrics(step, kl_divergences, importance_weights, policy_losses)
+        
+        # Save metrics summary periodically
+        if step % 100 == 0:
+            self.crsp_logger.save_metrics_summary(step)
+        
+        # Update running statistics for normalization
+        self._update_running_stats(avg_rewards)
+    
+    def _update_running_stats(self, rewards: Dict[str, float], momentum: float = 0.99):
+        """Update running statistics for reward normalization."""
+        for reward_type, value in rewards.items():
+            if reward_type in self.running_stats:
+                # Exponential moving average
+                self.running_stats[reward_type]['mean'] = (
+                    momentum * self.running_stats[reward_type]['mean'] + 
+                    (1 - momentum) * value
+                )
+                
+                # Update standard deviation estimate
+                diff = value - self.running_stats[reward_type]['mean']
+                self.running_stats[reward_type]['std'] = (
+                    momentum * self.running_stats[reward_type]['std'] + 
+                    (1 - momentum) * abs(diff)
+                )
+    
+    def compute_crsp_rewards(self, data_dict: Dict, correctness_score: float, 
+                           model=None) -> Dict[str, float]:
+        """
+        Compute CRSP-specific rewards including length and creativity rewards.
+        
+        Args:
+            data_dict: Data dictionary containing generation and metadata
+            correctness_score: Binary correctness score (0 or 1)
+            model: Optional model for critique evaluation
+            
+        Returns:
+            Dictionary containing all CRSP reward components
+        """
+        generation = data_dict.get('generation', '')
+        
+        # Get alpha values for current step
+        alpha_s, alpha_c = self.alpha_scheduler.compute_alpha_decay(
+            self.current_step, self.total_steps
+        )
+        
+        # Compute length reward
+        length_reward = self.compute_length_reward(generation, self.tokenizer)
+        
+        # Compute creativity reward
+        creativity_reward = self.critique_manager.compute_creativity_reward(generation, model)
+        
+        # Compute integrated rewards
+        solver_reward = alpha_s * correctness_score + (1 - alpha_s) * length_reward
+        
+        # For critique reward, use agreement as placeholder (can be enhanced)
+        agreement_score = 1.0 if correctness_score > 0.5 else 0.0
+        critique_reward = alpha_c * agreement_score + (1 - alpha_c) * creativity_reward
+        
+        # Create comprehensive reward dictionary
+        crsp_rewards = {
+            'correctness': correctness_score,
+            'length_reward': length_reward,
+            'creativity_reward': creativity_reward,
+            'solver_reward': solver_reward,
+            'critique_reward': critique_reward,
+            'alpha_s': alpha_s,
+            'alpha_c': alpha_c,
+            'agreement_score': agreement_score
+        }
+        
+        # Normalize rewards for training stability
+        normalized_rewards = self.normalize_and_clip_rewards(crsp_rewards, self.running_stats)
+        
+        return normalized_rewards
+    
+    def integrate_crsp_rewards_with_existing(self, existing_rewards: Dict[str, float], 
+                                           crsp_rewards: Dict[str, float]) -> Dict[str, float]:
+        """
+        Integrate CRSP rewards with existing reward computation for backward compatibility.
+        
+        Args:
+            existing_rewards: Existing reward dictionary
+            crsp_rewards: CRSP-specific rewards
+            
+        Returns:
+            Integrated reward dictionary
+        """
+        # Start with existing rewards
+        integrated_rewards = existing_rewards.copy()
+        
+        # Add CRSP-specific rewards
+        integrated_rewards.update(crsp_rewards)
+        
+        # Use solver reward as the main reward signal for training
+        # This maintains compatibility while adding CRSP enhancements
+        if 'solver_reward' in crsp_rewards:
+            integrated_rewards['reward'] = crsp_rewards['solver_reward']
+        
+        # Add critique reward as auxiliary signal
+        if 'critique_reward' in crsp_rewards:
+            integrated_rewards['critique'] = crsp_rewards['critique_reward']
+        
+        return integrated_rewards
+    
+    def compute_integrated_rewards(self, solution_text: str, correctness: float, step: int, total_steps: int, model=None) -> Tuple[float, float]:
+        """
+        Compute integrated CRSP rewards with alpha decay schedule.
+        
+        Args:
+            solution_text: The solution text to evaluate
+            correctness: Binary correctness score (0 or 1)
+            step: Current training step
+            total_steps: Total training steps
+            model: Optional model for critique evaluation
+            
+        Returns:
+            Tuple of (solver_reward, critique_reward)
+        """
+        # Get alpha values from decay schedule
+        alpha_s, alpha_c = self.alpha_scheduler.compute_alpha_decay(step, total_steps)
+        
+        # Compute length reward
+        length_reward = self.compute_length_reward(solution_text, self.tokenizer)
+        
+        # Compute creativity reward
+        creativity_reward = self.critique_manager.compute_creativity_reward(solution_text, model)
+        
+        # Compute integrated rewards
+        solver_reward = alpha_s * correctness + (1 - alpha_s) * length_reward
+        
+        # For critique reward, we use agreement as a placeholder (can be enhanced later)
+        agreement_score = 1.0 if correctness > 0.5 else 0.0  # Simple agreement heuristic
+        critique_reward = alpha_c * agreement_score + (1 - alpha_c) * creativity_reward
+        
+        return solver_reward, critique_reward
+    
+    def normalize_and_clip_rewards(self, rewards: Dict[str, float], running_stats: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+        """
+        Normalize and clip rewards for training stability.
+        
+        Args:
+            rewards: Dictionary of reward values
+            running_stats: Running statistics for normalization
+            
+        Returns:
+            Dictionary of normalized and clipped rewards
+        """
+        normalized_rewards = {}
+        
+        for reward_type, reward_value in rewards.items():
+            if reward_type in running_stats:
+                mu = running_stats[reward_type]['mean']
+                sigma = running_stats[reward_type]['std']
+                epsilon = 1e-8
+                
+                # Normalize
+                normalized_reward = (reward_value - mu) / (sigma + epsilon)
+                
+                # Clip for stability
+                if reward_type == 'creativity':
+                    normalized_reward = max(-2.0, min(2.0, normalized_reward))
+                
+                normalized_rewards[reward_type] = normalized_reward
+            else:
+                normalized_rewards[reward_type] = reward_value
+        
+        return normalized_rewards
+
+    @staticmethod
+    def compute_length_reward(solution_text: str, tokenizer: AutoTokenizer, max_length: int = 2048, penalty_threshold: int = 4096) -> float:
+        """
+        Compute length-based reward following RLSP logic.
+        Encourages thoughtful reasoning chains while preventing excessive verbosity.
+        
+        Args:
+            solution_text: The solution text to evaluate
+            tokenizer: Tokenizer to count tokens
+            max_length: Maximum desired reasoning length
+            penalty_threshold: Length threshold after which penalty is applied
+            
+        Returns:
+            Length reward score between 0 and 1
+        """
+        import math
+        
+        # Extract thinking content from <think> tags if present
+        think_pattern = r'<think>(.*?)</think>'
+        think_matches = re.findall(think_pattern, solution_text, re.DOTALL)
+        
+        if think_matches:
+            # Use the thinking content for length calculation
+            reasoning_text = think_matches[0].strip()
+        else:
+            # Use the full solution text
+            reasoning_text = solution_text.strip()
+        
+        # Count tokens
+        tokens = tokenizer.encode(reasoning_text)
+        token_count = len(tokens)
+        
+        if token_count == 0:
+            return 0.0
+        
+        # Logarithmic scaling up to max_length
+        length_reward = min(1.0, math.log(token_count + 1) / math.log(max_length))
+        
+        # Apply penalty for excessive length
+        if token_count > penalty_threshold:
+            penalty_factor = math.exp(-(token_count - penalty_threshold) / penalty_threshold)
+            length_reward *= penalty_factor
+        
+        return length_reward
 
     @staticmethod
     def extract_input_output(extracted_content: str, return_input: bool = True, return_output: bool = False) -> Tuple[str, str]:

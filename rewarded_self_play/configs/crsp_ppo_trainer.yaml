@@ -478,7 +478,38 @@ reward_fn:
   splitter: "Assistant:"
   boxed_retry: False
 
-azr:
+# Trajectory Seeding Configuration
+trajectory_seeding:
+  enabled: false
+  limo_dataset_path: "GAIR/LIMO"
+  cache_dir: "~/.cache/crsp/limo"
+  seeding_steps: 1000
+  epochs: 1
+  learning_rate: 1e-5
+  batch_size: 32
+  max_length: 2048
+  alpha: 0.1  # Weight for answer prediction in SFT loss
+  output_dir: "./trajectory_seeding_output"
+  validation_samples: 10
+  save_steps: 500
+  logging_steps: 100
+  weight_decay: 0.01
+  warmup_steps: 100
+  gradient_accumulation_steps: 1
+  fp16: true
+  dataloader_num_workers: 4
+  remove_unused_columns: false
+  # Validation configuration
+  validation:
+    enabled: true
+    eval_steps: 250
+    eval_strategy: "steps"
+    metric_for_best_model: "eval_loss"
+    greater_is_better: false
+    load_best_model_at_end: true
+    save_total_limit: 3
+
+crsp:
   seed: 1
   executor_max_workers: 1
   executor_cleanup_frequency: 1
@@ -488,7 +519,7 @@ azr:
     - code_f
   pred_data_mix_strategy: "max_new"  # [uniform_total, max_new, half_new, step]
   gen_data_probabilities_strategy: "uniform"  # [uniform, step]
-  past_epoch_window: ${azr.data_selection_strategy.update_iteration}
+  past_epoch_window: ${crsp.data_selection_strategy.update_iteration}
   seed_dataset: null
   error_seed_dataset: null
   output_seed_path: null
@@ -515,8 +546,8 @@ azr:
     composite_function_n_max: -1
     composite_chance: 0.5
     composite_start_step: -1
-    max_programs_initial: ${azr.data_selection_strategy.composite_function_n_max}
-    composite_chance_initial: ${azr.data_selection_strategy.composite_chance}
+    max_programs_initial: ${crsp.data_selection_strategy.composite_function_n_max}
+    composite_chance_initial: ${crsp.data_selection_strategy.composite_chance}
     composite_scheduler:
       enabled: False
       update_num_programs_start: 101

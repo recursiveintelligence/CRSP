@@ -1,4 +1,4 @@
-name: azr
+name: crsp
 channels:
   - nvidia/label/cuda-12.4.1
   - defaults

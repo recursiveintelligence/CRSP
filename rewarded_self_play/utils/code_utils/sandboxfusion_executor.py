@@ -11,7 +11,7 @@ import numpy as np
 from pebble import ProcessPool
 from sandbox_fusion import run_code, RunCodeRequest, set_endpoint, RunStatus
 
-from absolute_zero_reasoner.utils.code_utils.templates import (
+from rewarded_self_play.utils.code_utils.templates import (
     RUN_CODE_TEMPLATE_REPR,
     EVAL_INPUT_PREDICTION_TEMPLATE_REPR,
     EVAL_OUTPUT_PREDICTION_TEMPLATE_REPR,
@@ -20,8 +20,8 @@ from absolute_zero_reasoner.utils.code_utils.templates import (
     EVAL_K_INPUT_PREDICTION_TEMPLATE,
     EVAL_K_OUTPUT_PREDICTION_TEMPLATE,
 )
-from absolute_zero_reasoner.utils.code_utils.checks import contains_banned_imports
-from absolute_zero_reasoner.utils.code_utils.parsers import parse_error
+from rewarded_self_play.utils.code_utils.checks import contains_banned_imports
+from rewarded_self_play.utils.code_utils.parsers import parse_error
 
 
 # Docker images

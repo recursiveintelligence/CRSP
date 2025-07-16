@@ -6,9 +6,9 @@ from datasets import load_dataset
 from tqdm import tqdm
 import pandas as pd
 
-from absolute_zero_reasoner.rewards.code_reward import format_python_code
-from absolute_zero_reasoner.data_construction.prompts import get_code_problem_predictor_prompt
-from absolute_zero_reasoner.data_construction.process_data import instruction_following
+from rewarded_self_play.rewards.code_reward import format_python_code
+from rewarded_self_play.data_construction.prompts import get_code_problem_predictor_prompt
+from rewarded_self_play.data_construction.process_data import instruction_following
 
 def process_livecodebench_execution(row):
     # Extract all function names from the code
