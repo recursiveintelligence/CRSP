@@ -734,9 +734,8 @@ class CRSPRayPPOTrainer(ReasonRLRayPPOTrainer):
         for i in range(0, batch_size, chunk_size):
             end_idx = min(i + chunk_size, batch_size)
             
-            # Extract chunk
-            chunk_indices = list(range(i, end_idx))
-            chunk = batch.select(chunk_indices)
+            # Extract chunk using proper DataProto slicing
+            chunk = batch[i:end_idx]
             
             PrettyPrinter.status("CHUNK", f"Processing chunk {i//chunk_size + 1}/{(batch_size + chunk_size - 1)//chunk_size} (size: {len(chunk)})", "info")
             
