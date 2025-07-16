@@ -1161,6 +1161,7 @@ class CodeIORewardManager():
             for i, data_dict in enumerate(data_dicts):
                 valid_response_length = data_dict['valid_response_length']
                 imports = data_dict['imports']
+                input_output_accs = []  # Initialize for all problem types
                 if not problem_type.endswith('code_f'):
                     answer = data_dict['answer']
                     gold_input = data_dict['input']
